@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
 	"hash/fnv"
 	"io"
 	"runtime"
@@ -31,12 +32,13 @@ import (
 )
 
 var (
-	errRemoteAckNotifierRequired       = errors.New("app: remote ack notifier required")
-	errRemoteOfflineNotifierRequired   = errors.New("app: remote offline notifier required")
-	errCommittedDispatcherStopped      = errors.New("app: committed dispatcher stopped")
-	errMessageScopedDeliveryRequired   = errors.New("app: message scoped committed delivery required")
-	errMessageScopedOwnerRequired      = errors.New("app: message scoped committed owner required")
-	errMessageScopedNodeClientRequired = errors.New("app: message scoped committed node client required")
+	errRemoteAckNotifierRequired        = errors.New("app: remote ack notifier required")
+	errRemoteOfflineNotifierRequired    = errors.New("app: remote offline notifier required")
+	errCommittedDispatcherStopped       = errors.New("app: committed dispatcher stopped")
+	errMessageScopedDeliveryRequired    = errors.New("app: message scoped committed delivery required")
+	errMessageScopedOwnerRequired       = errors.New("app: message scoped committed owner required")
+	errMessageScopedNodeClientRequired  = errors.New("app: message scoped committed node client required")
+	errDeliveryTagSlotLeaderUnavailable = errors.New("app: delivery tag slot leader unavailable")
 )
 
 const (
@@ -675,11 +677,17 @@ type deliveryTagCluster interface {
 	HashSlotTableVersion() uint64
 	LeaderOf(slotID multiraft.SlotID) (multiraft.NodeID, error)
 	ListSlotAssignments(ctx context.Context) ([]controllermeta.SlotAssignment, error)
+	ListObservedRuntimeViewsStrict(ctx context.Context) ([]controllermeta.SlotRuntimeView, error)
 }
 
 type cachedDeliveryTagAssignments interface {
 	// ListCachedAssignments returns the node-local controller assignment snapshot without refreshing the controller leader.
 	ListCachedAssignments() []controllermeta.SlotAssignment
+}
+
+type cachedDeliveryTagRuntimeViews interface {
+	// ListCachedObservedRuntimeViews returns the latest controller-leader runtime view applied on this node.
+	ListCachedObservedRuntimeViews() ([]controllermeta.SlotRuntimeView, bool)
 }
 
 // tagDeliveryResolver resolves routes from leader-built delivery tag partitions.
@@ -740,16 +748,16 @@ func (r deliveryTagTopologyReaderAdapter) CurrentDeliveryTagTopology(ctx context
 	}
 	sort.Slice(slotIDs, func(i, j int) bool { return slotIDs[i] < slotIDs[j] })
 	assignmentBySlot := currentDeliveryTagAssignmentBySlot(ctx, r.cluster, slotIDs)
+	leaderBySlot, err := currentDeliveryTagLeaderBySlot(ctx, r.cluster, slotIDs, assignmentBySlot)
+	if err != nil {
+		return deliverytagruntime.PartitionTopologyVersion{}, err
+	}
 	refs := make([]deliverytagruntime.SlotAuthorityRef, 0, len(slotIDs))
 	for _, slotID := range slotIDs {
-		leaderID, err := r.cluster.LeaderOf(multiraft.SlotID(slotID))
-		if err != nil {
-			return deliverytagruntime.PartitionTopologyVersion{}, err
-		}
 		assignment := assignmentBySlot[slotID]
 		refs = append(refs, deliverytagruntime.SlotAuthorityRef{
 			SlotID:         slotID,
-			LeaderNodeID:   uint64(leaderID),
+			LeaderNodeID:   leaderBySlot[slotID],
 			ConfigEpoch:    assignment.ConfigEpoch,
 			BalanceVersion: assignment.BalanceVersion,
 		})
@@ -775,20 +783,87 @@ func (r deliveryTagTopologyReaderAdapter) ValidateCurrentDeliveryTagTopology(ctx
 		slotIDs = append(slotIDs, ref.SlotID)
 	}
 	assignmentBySlot := currentDeliveryTagAssignmentBySlot(ctx, r.cluster, slotIDs)
+	leaderBySlot, err := currentDeliveryTagLeaderBySlot(ctx, r.cluster, slotIDs, assignmentBySlot)
+	if err != nil {
+		return false, err
+	}
 	for _, ref := range topology.SlotAuthorityRefs {
-		leaderID, err := r.cluster.LeaderOf(multiraft.SlotID(ref.SlotID))
-		if err != nil {
-			return false, err
-		}
 		assignment, ok := assignmentBySlot[ref.SlotID]
 		if !ok {
 			return false, nil
 		}
-		if uint64(leaderID) != ref.LeaderNodeID || assignment.ConfigEpoch != ref.ConfigEpoch || assignment.BalanceVersion != ref.BalanceVersion {
+		if leaderBySlot[ref.SlotID] != ref.LeaderNodeID || assignment.ConfigEpoch != ref.ConfigEpoch || assignment.BalanceVersion != ref.BalanceVersion {
 			return false, nil
 		}
 	}
 	return true, nil
+}
+
+func currentDeliveryTagLeaderBySlot(ctx context.Context, cluster deliveryTagCluster, requiredSlotIDs []uint32, assignmentBySlot map[uint32]controllermeta.SlotAssignment) (map[uint32]uint64, error) {
+	localLeaderBySlot := make(map[uint32]uint64, len(requiredSlotIDs))
+	for _, slotID := range requiredSlotIDs {
+		leaderID, err := cluster.LeaderOf(multiraft.SlotID(slotID))
+		if err == nil && leaderID != 0 {
+			localLeaderBySlot[slotID] = uint64(leaderID)
+		}
+	}
+	leaderBySlot := cloneDeliveryTagLeaderMap(localLeaderBySlot)
+	if deliveryTagLeaderMapCoversSlots(leaderBySlot, requiredSlotIDs) {
+		return leaderBySlot, nil
+	}
+
+	if cached, ok := cluster.(cachedDeliveryTagRuntimeViews); ok {
+		if views, available := cached.ListCachedObservedRuntimeViews(); available {
+			mergeDeliveryTagObservedLeaders(leaderBySlot, views, requiredSlotIDs, assignmentBySlot)
+		}
+	}
+	if deliveryTagLeaderMapCoversSlots(leaderBySlot, requiredSlotIDs) {
+		return leaderBySlot, nil
+	}
+
+	views, err := cluster.ListObservedRuntimeViewsStrict(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// A strict refresh supersedes every cached observation while preserving
+	// leaders read directly from Slot runtimes hosted by this node.
+	leaderBySlot = cloneDeliveryTagLeaderMap(localLeaderBySlot)
+	mergeDeliveryTagObservedLeaders(leaderBySlot, views, requiredSlotIDs, assignmentBySlot)
+	for _, slotID := range requiredSlotIDs {
+		if leaderBySlot[slotID] == 0 {
+			return nil, fmt.Errorf("%w: slot_id=%d", errDeliveryTagSlotLeaderUnavailable, slotID)
+		}
+	}
+	return leaderBySlot, nil
+}
+
+func mergeDeliveryTagObservedLeaders(leaderBySlot map[uint32]uint64, views []controllermeta.SlotRuntimeView, requiredSlotIDs []uint32, assignmentBySlot map[uint32]controllermeta.SlotAssignment) {
+	for _, view := range views {
+		if leaderBySlot[view.SlotID] != 0 || view.LeaderID == 0 || !view.HasQuorum || !deliveryTagSlotRequired(view.SlotID, requiredSlotIDs) {
+			continue
+		}
+		if assignment, ok := assignmentBySlot[view.SlotID]; ok && assignment.ConfigEpoch != 0 && view.ObservedConfigEpoch < assignment.ConfigEpoch {
+			continue
+		}
+		leaderBySlot[view.SlotID] = view.LeaderID
+	}
+}
+
+func cloneDeliveryTagLeaderMap(in map[uint32]uint64) map[uint32]uint64 {
+	out := make(map[uint32]uint64, len(in))
+	for slotID, leaderID := range in {
+		out[slotID] = leaderID
+	}
+	return out
+}
+
+func deliveryTagLeaderMapCoversSlots(leaderBySlot map[uint32]uint64, requiredSlotIDs []uint32) bool {
+	for _, slotID := range requiredSlotIDs {
+		if leaderBySlot[slotID] == 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func currentDeliveryTagAssignmentBySlot(ctx context.Context, cluster deliveryTagCluster, requiredSlotIDs []uint32) map[uint32]controllermeta.SlotAssignment {
