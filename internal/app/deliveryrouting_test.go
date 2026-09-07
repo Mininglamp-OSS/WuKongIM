@@ -1370,6 +1370,50 @@ func TestDeliveryRoutingReturnsCachedTagValidationErrorWithoutRebuilding(t *test
 	require.Zero(t, store.pageCalls)
 }
 
+func TestDeliveryRoutingRebuildsNewerSubscriberSnapshotBeforeCachedTagValidation(t *testing.T) {
+	cachedTopology := testDeliveryTagTopology(9)
+	currentTopology := testDeliveryTagTopology(10)
+	manager := deliverytagruntime.NewManager(deliverytagruntime.Options{
+		LocalNodeID: 1,
+		NewTagKey:   func() string { return "tag-stale-validation" },
+	})
+	_, created := manager.BuildLeaderTag(deliverytagruntime.BuildRequest{
+		ChannelKey:                      "2:g-stale-validation",
+		SubscriberMutationVersion:       4,
+		SourceChannelKey:                "2:g-stale-validation",
+		SourceSubscriberMutationVersion: 4,
+		Topology:                        cachedTopology,
+	})
+	require.True(t, created)
+
+	store := &resolverVersionStore{uids: []string{"u1"}, version: 5}
+	topologyReader := &recordingDeliveryTagTopology{
+		version:     currentTopology,
+		validateErr: errors.New("cached topology is temporarily unavailable"),
+	}
+	resolver := tagDeliveryResolver{
+		localNodeID: 1,
+		tags:        manager,
+		subscribers: deliveryusecase.NewSubscriberResolver(deliveryusecase.SubscriberResolverOptions{Store: store}),
+		topology:    topologyReader,
+		pageSize:    8,
+	}
+
+	_, err := resolver.BeginResolve(context.Background(), deliveryruntime.ChannelKey{
+		ChannelID:   "g-stale-validation",
+		ChannelType: frame.ChannelTypeGroup,
+	}, deliveryruntime.CommittedEnvelope{})
+
+	require.NoError(t, err)
+	require.Zero(t, topologyReader.validateCalls)
+	require.Equal(t, 1, topologyReader.currentCalls)
+	require.NotZero(t, store.pageCalls)
+	ref, ok := manager.CurrentRef("2:g-stale-validation")
+	require.True(t, ok)
+	require.Equal(t, uint64(5), ref.SubscriberMutationVersion)
+	require.Equal(t, currentTopology, ref.Topology)
+}
+
 func TestDeliveryRoutingSkipsCachedTagFastPathWithoutVersionFence(t *testing.T) {
 	topology := deliverytagruntime.PartitionTopologyVersion{
 		HashSlotTableVersion: 9,

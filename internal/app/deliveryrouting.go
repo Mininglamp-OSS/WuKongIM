@@ -1333,21 +1333,22 @@ func (r tagDeliveryResolver) leaderTagFromSnapshot(ctx context.Context, key deli
 	source := snapshot.Source()
 	if deliveryTagCanUseCachedTagFastPath(source) {
 		if ref, ok := r.tags.CurrentRef(channelKey); ok {
-			if validator, ok := r.topology.(deliveryTagTopologyValidator); ok {
-				valid, err := validator.ValidateCurrentDeliveryTagTopology(ctx, ref.Topology)
-				if err != nil {
-					return deliverytagruntime.DeliveryTag{}, err
-				}
-				if valid {
-					if tag, hit, reason := r.tags.LookupLocalPartitionRef(deliverytagruntime.TagRef{
-						ChannelKey:                      channelKey,
-						TagKey:                          ref.TagKey,
-						TagVersion:                      ref.TagVersion,
-						SubscriberMutationVersion:       source.SubscriberMutationVersion,
-						SourceChannelKey:                deliveryTagSourceChannelKey(source),
-						SourceSubscriberMutationVersion: source.SourceSubscriberMutationVersion,
-						Topology:                        ref.Topology,
-					}); hit || reason == deliverytagruntime.LookupStaleRequest {
+			tag, hit, reason := r.tags.LookupLocalPartitionRef(deliverytagruntime.TagRef{
+				ChannelKey:                      channelKey,
+				TagKey:                          ref.TagKey,
+				TagVersion:                      ref.TagVersion,
+				SubscriberMutationVersion:       source.SubscriberMutationVersion,
+				SourceChannelKey:                deliveryTagSourceChannelKey(source),
+				SourceSubscriberMutationVersion: source.SourceSubscriberMutationVersion,
+				Topology:                        ref.Topology,
+			})
+			if hit || reason == deliverytagruntime.LookupStaleRequest {
+				if validator, ok := r.topology.(deliveryTagTopologyValidator); ok {
+					valid, err := validator.ValidateCurrentDeliveryTagTopology(ctx, tag.Topology)
+					if err != nil {
+						return deliverytagruntime.DeliveryTag{}, err
+					}
+					if valid {
 						return tag, nil
 					}
 				}
