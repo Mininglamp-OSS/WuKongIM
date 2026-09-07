@@ -55,6 +55,10 @@ const (
 	deliveryPushRouteChunkSize = 1000
 	// deliveryTagStrictRuntimeViewTimeout keeps a controller refresh below the first delivery retry interval.
 	deliveryTagStrictRuntimeViewTimeout = 500 * time.Millisecond
+	// deliveryTagStrictRuntimeViewCacheTTL lets retries share one successful controller snapshot.
+	deliveryTagStrictRuntimeViewCacheTTL = time.Second
+	// deliveryTagStrictRuntimeViewFailureBackoff prevents one controller failure per queued message.
+	deliveryTagStrictRuntimeViewFailureBackoff = 500 * time.Millisecond
 
 	deliveryTagRPCStatusOK              = "ok"
 	deliveryTagRPCStatusRetryable       = "retryable"
@@ -736,7 +740,25 @@ func (a deliveryTagAuthority) UpdateDeliveryTag(_ context.Context, req accessnod
 }
 
 type deliveryTagTopologyReaderAdapter struct {
-	cluster deliveryTagCluster
+	cluster              deliveryTagCluster
+	runtimeViewRefreshes *deliveryTagRuntimeViewRefreshCoordinator
+}
+
+// deliveryTagRuntimeViewRefreshCoordinator keeps strict controller reads off the
+// synchronous delivery path and coalesces refreshes across concurrent messages.
+type deliveryTagRuntimeViewRefreshCoordinator struct {
+	mu        sync.Mutex
+	inFlight  bool
+	views     []controllermeta.SlotRuntimeView
+	err       error
+	expiresAt time.Time
+}
+
+func newDeliveryTagTopologyReaderAdapter(cluster deliveryTagCluster) deliveryTagTopologyReaderAdapter {
+	return deliveryTagTopologyReaderAdapter{
+		cluster:              cluster,
+		runtimeViewRefreshes: &deliveryTagRuntimeViewRefreshCoordinator{},
+	}
 }
 
 func (r deliveryTagTopologyReaderAdapter) CurrentDeliveryTagTopology(ctx context.Context, uids []string) (deliverytagruntime.PartitionTopologyVersion, error) {
@@ -753,7 +775,7 @@ func (r deliveryTagTopologyReaderAdapter) CurrentDeliveryTagTopology(ctx context
 	}
 	sort.Slice(slotIDs, func(i, j int) bool { return slotIDs[i] < slotIDs[j] })
 	assignmentBySlot := currentDeliveryTagAssignmentBySlot(ctx, r.cluster, slotIDs)
-	leaderBySlot, err := currentDeliveryTagLeaderBySlot(ctx, r.cluster, slotIDs, assignmentBySlot)
+	leaderBySlot, err := currentDeliveryTagLeaderBySlot(ctx, r.cluster, r.runtimeViewRefreshes, slotIDs, assignmentBySlot)
 	if err != nil {
 		return deliverytagruntime.PartitionTopologyVersion{}, err
 	}
@@ -788,7 +810,7 @@ func (r deliveryTagTopologyReaderAdapter) ValidateCurrentDeliveryTagTopology(ctx
 		slotIDs = append(slotIDs, ref.SlotID)
 	}
 	assignmentBySlot := currentDeliveryTagAssignmentBySlot(ctx, r.cluster, slotIDs)
-	leaderBySlot, err := currentDeliveryTagLeaderBySlot(ctx, r.cluster, slotIDs, assignmentBySlot)
+	leaderBySlot, err := currentDeliveryTagLeaderBySlot(ctx, r.cluster, r.runtimeViewRefreshes, slotIDs, assignmentBySlot)
 	if err != nil {
 		return false, err
 	}
@@ -804,7 +826,7 @@ func (r deliveryTagTopologyReaderAdapter) ValidateCurrentDeliveryTagTopology(ctx
 	return true, nil
 }
 
-func currentDeliveryTagLeaderBySlot(ctx context.Context, cluster deliveryTagCluster, requiredSlotIDs []uint32, assignmentBySlot map[uint32]controllermeta.SlotAssignment) (map[uint32]uint64, error) {
+func currentDeliveryTagLeaderBySlot(ctx context.Context, cluster deliveryTagCluster, runtimeViewRefreshes *deliveryTagRuntimeViewRefreshCoordinator, requiredSlotIDs []uint32, assignmentBySlot map[uint32]controllermeta.SlotAssignment) (map[uint32]uint64, error) {
 	localLeaderBySlot := make(map[uint32]uint64, len(requiredSlotIDs))
 	for _, slotID := range requiredSlotIDs {
 		leaderID, err := cluster.LeaderOf(multiraft.SlotID(slotID))
@@ -826,9 +848,21 @@ func currentDeliveryTagLeaderBySlot(ctx context.Context, cluster deliveryTagClus
 		return leaderBySlot, nil
 	}
 
-	refreshCtx, cancel := context.WithTimeout(ctx, deliveryTagStrictRuntimeViewTimeout)
-	views, err := cluster.ListObservedRuntimeViewsStrict(refreshCtx)
-	cancel()
+	var (
+		views []controllermeta.SlotRuntimeView
+		err   error
+	)
+	if runtimeViewRefreshes == nil {
+		refreshCtx, cancel := context.WithTimeout(ctx, deliveryTagStrictRuntimeViewTimeout)
+		views, err = cluster.ListObservedRuntimeViewsStrict(refreshCtx)
+		cancel()
+	} else {
+		var ready bool
+		views, err, ready = runtimeViewRefreshes.loadOrStart(ctx, cluster)
+		if !ready {
+			return nil, deliveryTagMissingSlotLeaderError(leaderBySlot, requiredSlotIDs)
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -836,12 +870,73 @@ func currentDeliveryTagLeaderBySlot(ctx context.Context, cluster deliveryTagClus
 	// leaders read directly from Slot runtimes hosted by this node.
 	leaderBySlot = cloneDeliveryTagLeaderMap(localLeaderBySlot)
 	mergeDeliveryTagObservedLeaders(leaderBySlot, views, requiredSlotIDs, assignmentBySlot)
-	for _, slotID := range requiredSlotIDs {
-		if leaderBySlot[slotID] == 0 {
-			return nil, fmt.Errorf("%w: slot_id=%d", errDeliveryTagSlotLeaderUnavailable, slotID)
-		}
+	if err := deliveryTagMissingSlotLeaderError(leaderBySlot, requiredSlotIDs); err != nil {
+		return nil, err
 	}
 	return leaderBySlot, nil
+}
+
+func (c *deliveryTagRuntimeViewRefreshCoordinator) loadOrStart(ctx context.Context, cluster deliveryTagCluster) ([]controllermeta.SlotRuntimeView, error, bool) {
+	if c == nil {
+		return nil, nil, false
+	}
+	now := time.Now()
+	c.mu.Lock()
+	if now.Before(c.expiresAt) {
+		views := cloneDeliveryTagRuntimeViews(c.views)
+		err := c.err
+		c.mu.Unlock()
+		return views, err, true
+	}
+	if !c.inFlight {
+		c.inFlight = true
+		refreshBase := context.Background()
+		if ctx != nil {
+			refreshBase = context.WithoutCancel(ctx)
+		}
+		go c.refresh(refreshBase, cluster)
+	}
+	c.mu.Unlock()
+	return nil, nil, false
+}
+
+func (c *deliveryTagRuntimeViewRefreshCoordinator) refresh(ctx context.Context, cluster deliveryTagCluster) {
+	refreshCtx, cancel := context.WithTimeout(ctx, deliveryTagStrictRuntimeViewTimeout)
+	views, err := cluster.ListObservedRuntimeViewsStrict(refreshCtx)
+	cancel()
+
+	ttl := deliveryTagStrictRuntimeViewCacheTTL
+	if err != nil {
+		ttl = deliveryTagStrictRuntimeViewFailureBackoff
+	}
+	c.mu.Lock()
+	c.views = cloneDeliveryTagRuntimeViews(views)
+	c.err = err
+	c.expiresAt = time.Now().Add(ttl)
+	c.inFlight = false
+	c.mu.Unlock()
+}
+
+func cloneDeliveryTagRuntimeViews(views []controllermeta.SlotRuntimeView) []controllermeta.SlotRuntimeView {
+	if len(views) == 0 {
+		return nil
+	}
+	out := make([]controllermeta.SlotRuntimeView, len(views))
+	for i, view := range views {
+		out[i] = view
+		out[i].CurrentPeers = append([]uint64(nil), view.CurrentPeers...)
+		out[i].CurrentVoters = append([]uint64(nil), view.CurrentVoters...)
+	}
+	return out
+}
+
+func deliveryTagMissingSlotLeaderError(leaderBySlot map[uint32]uint64, requiredSlotIDs []uint32) error {
+	for _, slotID := range requiredSlotIDs {
+		if leaderBySlot[slotID] == 0 {
+			return fmt.Errorf("%w: slot_id=%d", errDeliveryTagSlotLeaderUnavailable, slotID)
+		}
+	}
+	return nil
 }
 
 func mergeDeliveryTagObservedLeaders(leaderBySlot map[uint32]uint64, views []controllermeta.SlotRuntimeView, requiredSlotIDs []uint32, assignmentBySlot map[uint32]controllermeta.SlotAssignment) {

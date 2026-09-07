@@ -166,7 +166,7 @@ func TestDeliveryTagTopologyResolvesNonLocalSlotInFiveNodeCluster(t *testing.T) 
 	}
 	require.NotEmpty(t, subscriberUID)
 
-	reader := deliveryTagTopologyReaderAdapter{cluster: materializer.Cluster()}
+	reader := newDeliveryTagTopologyReaderAdapter(materializer.Cluster())
 	var topology deliverytagruntime.PartitionTopologyVersion
 	require.Eventually(t, func() bool {
 		current, err := reader.CurrentDeliveryTagTopology(ctx, []string{subscriberUID})

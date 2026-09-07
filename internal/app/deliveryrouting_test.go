@@ -1596,6 +1596,89 @@ func TestDeliveryTagTopologyReaderBoundsStrictRuntimeViewRefresh(t *testing.T) {
 	require.LessOrEqual(t, remaining, deliveryTagStrictRuntimeViewTimeout)
 }
 
+func TestDeliveryTagTopologyReaderRefreshesStrictViewsAsynchronouslyAndCoalesces(t *testing.T) {
+	release := make(chan struct{})
+	cluster := &recordingDeliveryTagCluster{
+		slotByKey: map[string]multiraft.SlotID{"u1": 2},
+		leaderErrBySlot: map[multiraft.SlotID]error{
+			2: multiraft.ErrSlotNotFound,
+		},
+		cachedAssignments: []controllermeta.SlotAssignment{
+			{SlotID: 2, ConfigEpoch: 22},
+		},
+		strictRuntimeViews: []controllermeta.SlotRuntimeView{
+			{SlotID: 2, LeaderID: 12, HasQuorum: true, ObservedConfigEpoch: 22},
+		},
+		strictRuntimeViewsStarted: make(chan struct{}),
+		strictRuntimeViewsRelease: release,
+	}
+	reader := newDeliveryTagTopologyReaderAdapter(cluster)
+
+	returned := make(chan error, 1)
+	go func() {
+		_, err := reader.CurrentDeliveryTagTopology(context.Background(), []string{"u1"})
+		returned <- err
+	}()
+	select {
+	case err := <-returned:
+		require.ErrorIs(t, err, errDeliveryTagSlotLeaderUnavailable)
+	case <-time.After(100 * time.Millisecond):
+		require.FailNow(t, "topology lookup blocked on strict controller refresh")
+	}
+	select {
+	case <-cluster.strictRuntimeViewsStarted:
+	case <-time.After(time.Second):
+		require.FailNow(t, "strict controller refresh did not start")
+	}
+
+	for range 5 {
+		_, err := reader.CurrentDeliveryTagTopology(context.Background(), []string{"u1"})
+		require.ErrorIs(t, err, errDeliveryTagSlotLeaderUnavailable)
+	}
+	require.Equal(t, 1, cluster.ListObservedRuntimeViewsStrictCalls())
+
+	close(release)
+	var topology deliverytagruntime.PartitionTopologyVersion
+	require.Eventually(t, func() bool {
+		current, err := reader.CurrentDeliveryTagTopology(context.Background(), []string{"u1"})
+		if err != nil {
+			return false
+		}
+		topology = current
+		return true
+	}, time.Second, 10*time.Millisecond)
+	require.Equal(t, uint64(12), topology.SlotAuthorityRefs[0].LeaderNodeID)
+	require.Equal(t, 1, cluster.ListObservedRuntimeViewsStrictCalls())
+}
+
+func TestDeliveryTagTopologyReaderBacksOffAfterStrictRefreshFailure(t *testing.T) {
+	refreshErr := errors.New("controller unavailable")
+	cluster := &recordingDeliveryTagCluster{
+		slotByKey: map[string]multiraft.SlotID{"u1": 2},
+		leaderErrBySlot: map[multiraft.SlotID]error{
+			2: multiraft.ErrSlotNotFound,
+		},
+		cachedAssignments: []controllermeta.SlotAssignment{
+			{SlotID: 2, ConfigEpoch: 22},
+		},
+		strictRuntimeViewsErr: refreshErr,
+	}
+	reader := newDeliveryTagTopologyReaderAdapter(cluster)
+
+	_, err := reader.CurrentDeliveryTagTopology(context.Background(), []string{"u1"})
+	require.ErrorIs(t, err, errDeliveryTagSlotLeaderUnavailable)
+	require.Eventually(t, func() bool {
+		_, currentErr := reader.CurrentDeliveryTagTopology(context.Background(), []string{"u1"})
+		return errors.Is(currentErr, refreshErr)
+	}, time.Second, 10*time.Millisecond)
+
+	for range 5 {
+		_, err = reader.CurrentDeliveryTagTopology(context.Background(), []string{"u1"})
+		require.ErrorIs(t, err, refreshErr)
+	}
+	require.Equal(t, 1, cluster.ListObservedRuntimeViewsStrictCalls())
+}
+
 func TestDeliveryTagTopologyReaderRejectsNonLocalSlotWithoutStableObservedLeader(t *testing.T) {
 	cluster := &recordingDeliveryTagCluster{
 		slotByKey: map[string]multiraft.SlotID{"u1": 2},
@@ -3369,6 +3452,7 @@ func (r *recordingDeliveryTagTopology) ValidateCurrentDeliveryTagTopology(_ cont
 }
 
 type recordingDeliveryTagCluster struct {
+	strictMu                      sync.Mutex
 	slotByKey                     map[string]multiraft.SlotID
 	leaderBySlot                  map[multiraft.SlotID]multiraft.NodeID
 	leaderErrBySlot               map[multiraft.SlotID]error
@@ -3382,6 +3466,9 @@ type recordingDeliveryTagCluster struct {
 	strictRuntimeViewsErr         error
 	strictRuntimeViewsDeadline    time.Time
 	strictRuntimeViewsHasDeadline bool
+	strictRuntimeViewsStarted     chan struct{}
+	strictRuntimeViewsStartedOnce sync.Once
+	strictRuntimeViewsRelease     <-chan struct{}
 	listObservedRuntimeViewsCalls int
 }
 
@@ -3411,9 +3498,25 @@ func (c *recordingDeliveryTagCluster) ListCachedObservedRuntimeViews() ([]contro
 }
 
 func (c *recordingDeliveryTagCluster) ListObservedRuntimeViewsStrict(ctx context.Context) ([]controllermeta.SlotRuntimeView, error) {
+	c.strictMu.Lock()
 	c.listObservedRuntimeViewsCalls++
 	c.strictRuntimeViewsDeadline, c.strictRuntimeViewsHasDeadline = ctx.Deadline()
-	return append([]controllermeta.SlotRuntimeView(nil), c.strictRuntimeViews...), c.strictRuntimeViewsErr
+	views := append([]controllermeta.SlotRuntimeView(nil), c.strictRuntimeViews...)
+	err := c.strictRuntimeViewsErr
+	started := c.strictRuntimeViewsStarted
+	release := c.strictRuntimeViewsRelease
+	c.strictMu.Unlock()
+	if started != nil {
+		c.strictRuntimeViewsStartedOnce.Do(func() { close(started) })
+	}
+	if release != nil {
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return views, err
 }
 
 func (c *recordingDeliveryTagCluster) ListSlotAssignments(context.Context) ([]controllermeta.SlotAssignment, error) {
@@ -3430,6 +3533,8 @@ func (c *recordingDeliveryTagCluster) ListSlotAssignmentsCalls() int {
 }
 
 func (c *recordingDeliveryTagCluster) ListObservedRuntimeViewsStrictCalls() int {
+	c.strictMu.Lock()
+	defer c.strictMu.Unlock()
 	return c.listObservedRuntimeViewsCalls
 }
 
