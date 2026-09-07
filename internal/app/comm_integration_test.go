@@ -217,16 +217,24 @@ func newThreeNodeManagedAppHarnessWithLayout(t *testing.T, slotCount uint32, slo
 	return newThreeNodeAppHarnessWithOptions(t, slotCount, slotReplicaN, nil)
 }
 
+func newFiveNodeManagedAppHarnessWithLayout(t *testing.T, slotCount uint32, slotReplicaN int) *threeNodeAppHarness {
+	return newAppHarnessWithOptions(t, 5, slotCount, slotReplicaN, nil)
+}
+
 func newThreeNodeAppHarnessWithConfigMutator(t *testing.T, mutate func(*Config)) *threeNodeAppHarness {
 	return newThreeNodeAppHarnessWithOptions(t, 1, 3, mutate)
 }
 
 func newThreeNodeAppHarnessWithOptions(t *testing.T, slotCount uint32, slotReplicaN int, mutate func(*Config)) *threeNodeAppHarness {
+	return newAppHarnessWithOptions(t, 3, slotCount, slotReplicaN, mutate)
+}
+
+func newAppHarnessWithOptions(t *testing.T, nodeCount int, slotCount uint32, slotReplicaN int, mutate func(*Config)) *threeNodeAppHarness {
 	t.Helper()
 
 	var lastErr error
 	for attempt := 1; attempt <= threeNodeHarnessStartAttempts; attempt++ {
-		harness, cleanup, err := buildThreeNodeAppHarness(t, slotCount, slotReplicaN, mutate)
+		harness, cleanup, err := buildAppHarness(t, nodeCount, slotCount, slotReplicaN, mutate)
 		if err == nil {
 			t.Cleanup(func() {
 				require.NoError(t, cleanup())
@@ -236,13 +244,13 @@ func newThreeNodeAppHarnessWithOptions(t *testing.T, slotCount uint32, slotRepli
 
 		lastErr = err
 		if cleanupErr := cleanup(); cleanupErr != nil {
-			t.Logf("cleanup failed after three-node harness startup error: %v", cleanupErr)
+			t.Logf("cleanup failed after %d-node harness startup error: %v", nodeCount, cleanupErr)
 		}
 		if attempt == threeNodeHarnessStartAttempts {
 			break
 		}
 
-		t.Logf("retrying three-node harness startup (%d/%d): %v", attempt, threeNodeHarnessStartAttempts, err)
+		t.Logf("retrying %d-node harness startup (%d/%d): %v", nodeCount, attempt, threeNodeHarnessStartAttempts, err)
 		time.Sleep(time.Duration(attempt) * threeNodeHarnessRetryBackoff)
 	}
 
@@ -250,14 +258,14 @@ func newThreeNodeAppHarnessWithOptions(t *testing.T, slotCount uint32, slotRepli
 	return nil
 }
 
-func buildThreeNodeAppHarness(t *testing.T, slotCount uint32, slotReplicaN int, mutate func(*Config)) (*threeNodeAppHarness, func() error, error) {
+func buildAppHarness(t *testing.T, nodeCount int, slotCount uint32, slotReplicaN int, mutate func(*Config)) (*threeNodeAppHarness, func() error, error) {
 	t.Helper()
 
-	clusterAddrs := reserveTestTCPAddrs(t, 3)
-	gatewayAddrs := reserveTestTCPAddrs(t, 3)
-	apiAddrs := reserveTestTCPAddrs(t, 3)
-	clusterNodes := make([]NodeConfigRef, 0, 3)
-	for i := 0; i < 3; i++ {
+	clusterAddrs := reserveTestTCPAddrs(t, nodeCount)
+	gatewayAddrs := reserveTestTCPAddrs(t, nodeCount)
+	apiAddrs := reserveTestTCPAddrs(t, nodeCount)
+	clusterNodes := make([]NodeConfigRef, 0, nodeCount)
+	for i := 0; i < nodeCount; i++ {
 		clusterNodes = append(clusterNodes, NodeConfigRef{
 			ID:   uint64(i + 1),
 			Addr: clusterAddrs[uint64(i+1)],
@@ -265,9 +273,9 @@ func buildThreeNodeAppHarness(t *testing.T, slotCount uint32, slotReplicaN int, 
 	}
 
 	root := t.TempDir()
-	apps := make(map[uint64]*App, 3)
-	specs := make(map[uint64]appNodeSpec, 3)
-	for i := 0; i < 3; i++ {
+	apps := make(map[uint64]*App, nodeCount)
+	specs := make(map[uint64]appNodeSpec, nodeCount)
+	for i := 0; i < nodeCount; i++ {
 		nodeID := uint64(i + 1)
 		cfg := validConfig()
 		cfg.Node.ID = nodeID

@@ -24,6 +24,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/internal/usecase/message"
 	"github.com/WuKongIM/WuKongIM/internal/usecase/presence"
 	"github.com/WuKongIM/WuKongIM/pkg/channel"
+	raftcluster "github.com/WuKongIM/WuKongIM/pkg/cluster"
 	controllermeta "github.com/WuKongIM/WuKongIM/pkg/controller/meta"
 	"github.com/WuKongIM/WuKongIM/pkg/protocol/codec"
 	"github.com/WuKongIM/WuKongIM/pkg/protocol/frame"
@@ -52,6 +53,8 @@ const (
 
 	// deliveryPushRouteChunkSize bounds the route list carried by one remote push RPC.
 	deliveryPushRouteChunkSize = 1000
+	// deliveryTagStrictRuntimeViewTimeout keeps a controller refresh below the first delivery retry interval.
+	deliveryTagStrictRuntimeViewTimeout = 500 * time.Millisecond
 
 	deliveryTagRPCStatusOK              = "ok"
 	deliveryTagRPCStatusRetryable       = "retryable"
@@ -690,6 +693,8 @@ type cachedDeliveryTagRuntimeViews interface {
 	ListCachedObservedRuntimeViews() ([]controllermeta.SlotRuntimeView, bool)
 }
 
+var _ cachedDeliveryTagRuntimeViews = (*raftcluster.Cluster)(nil)
+
 // tagDeliveryResolver resolves routes from leader-built delivery tag partitions.
 type tagDeliveryResolver struct {
 	localNodeID        uint64
@@ -821,7 +826,9 @@ func currentDeliveryTagLeaderBySlot(ctx context.Context, cluster deliveryTagClus
 		return leaderBySlot, nil
 	}
 
-	views, err := cluster.ListObservedRuntimeViewsStrict(ctx)
+	refreshCtx, cancel := context.WithTimeout(ctx, deliveryTagStrictRuntimeViewTimeout)
+	views, err := cluster.ListObservedRuntimeViewsStrict(refreshCtx)
+	cancel()
 	if err != nil {
 		return nil, err
 	}
@@ -838,8 +845,15 @@ func currentDeliveryTagLeaderBySlot(ctx context.Context, cluster deliveryTagClus
 }
 
 func mergeDeliveryTagObservedLeaders(leaderBySlot map[uint32]uint64, views []controllermeta.SlotRuntimeView, requiredSlotIDs []uint32, assignmentBySlot map[uint32]controllermeta.SlotAssignment) {
+	requiredSlotSet := make(map[uint32]struct{}, len(requiredSlotIDs))
+	for _, slotID := range requiredSlotIDs {
+		requiredSlotSet[slotID] = struct{}{}
+	}
 	for _, view := range views {
-		if leaderBySlot[view.SlotID] != 0 || view.LeaderID == 0 || !view.HasQuorum || !deliveryTagSlotRequired(view.SlotID, requiredSlotIDs) {
+		if _, required := requiredSlotSet[view.SlotID]; !required {
+			continue
+		}
+		if leaderBySlot[view.SlotID] != 0 || view.LeaderID == 0 || !view.HasQuorum {
 			continue
 		}
 		if assignment, ok := assignmentBySlot[view.SlotID]; ok && assignment.ConfigEpoch != 0 && view.ObservedConfigEpoch < assignment.ConfigEpoch {
@@ -1321,7 +1335,10 @@ func (r tagDeliveryResolver) leaderTagFromSnapshot(ctx context.Context, key deli
 		if ref, ok := r.tags.CurrentRef(channelKey); ok {
 			if validator, ok := r.topology.(deliveryTagTopologyValidator); ok {
 				valid, err := validator.ValidateCurrentDeliveryTagTopology(ctx, ref.Topology)
-				if err == nil && valid {
+				if err != nil {
+					return deliverytagruntime.DeliveryTag{}, err
+				}
+				if valid {
 					if tag, hit, reason := r.tags.LookupLocalPartitionRef(deliverytagruntime.TagRef{
 						ChannelKey:                      channelKey,
 						TagKey:                          ref.TagKey,

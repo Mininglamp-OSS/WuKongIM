@@ -1330,6 +1330,46 @@ func TestDeliveryRoutingUsesCachedTagWithoutListingSubscribers(t *testing.T) {
 	require.Zero(t, store.pageCalls)
 }
 
+func TestDeliveryRoutingReturnsCachedTagValidationErrorWithoutRebuilding(t *testing.T) {
+	topology := testDeliveryTagTopology(9)
+	manager := deliverytagruntime.NewManager(deliverytagruntime.Options{
+		LocalNodeID: 1,
+		NewTagKey:   func() string { return "tag-validation-error" },
+	})
+	_, created := manager.BuildLeaderTag(deliverytagruntime.BuildRequest{
+		ChannelKey:                      "2:g-validation-error",
+		SubscriberMutationVersion:       4,
+		SourceChannelKey:                "2:g-validation-error",
+		SourceSubscriberMutationVersion: 4,
+		Topology:                        topology,
+	})
+	require.True(t, created)
+
+	store := &resolverVersionStore{uids: []string{"u1"}, version: 4}
+	validationErr := errors.New("controller view unavailable")
+	topologyReader := &recordingDeliveryTagTopology{
+		version:     topology,
+		validateErr: validationErr,
+	}
+	resolver := tagDeliveryResolver{
+		localNodeID: 1,
+		tags:        manager,
+		subscribers: deliveryusecase.NewSubscriberResolver(deliveryusecase.SubscriberResolverOptions{Store: store}),
+		topology:    topologyReader,
+		pageSize:    8,
+	}
+
+	_, err := resolver.BeginResolve(context.Background(), deliveryruntime.ChannelKey{
+		ChannelID:   "g-validation-error",
+		ChannelType: frame.ChannelTypeGroup,
+	}, deliveryruntime.CommittedEnvelope{})
+
+	require.ErrorIs(t, err, validationErr)
+	require.Equal(t, 1, topologyReader.validateCalls)
+	require.Zero(t, topologyReader.currentCalls)
+	require.Zero(t, store.pageCalls)
+}
+
 func TestDeliveryRoutingSkipsCachedTagFastPathWithoutVersionFence(t *testing.T) {
 	topology := deliverytagruntime.PartitionTopologyVersion{
 		HashSlotTableVersion: 9,
@@ -1486,6 +1526,30 @@ func TestDeliveryTagTopologyReaderRefreshesObservedLeadersOnceForNonLocalSlots(t
 		{SlotID: 2, LeaderNodeID: 12, ConfigEpoch: 22, BalanceVersion: 32},
 	}, topology.SlotAuthorityRefs)
 	require.Equal(t, 1, cluster.ListObservedRuntimeViewsStrictCalls())
+}
+
+func TestDeliveryTagTopologyReaderBoundsStrictRuntimeViewRefresh(t *testing.T) {
+	cluster := &recordingDeliveryTagCluster{
+		slotByKey: map[string]multiraft.SlotID{"u1": 2},
+		leaderErrBySlot: map[multiraft.SlotID]error{
+			2: multiraft.ErrSlotNotFound,
+		},
+		cachedAssignments: []controllermeta.SlotAssignment{
+			{SlotID: 2, ConfigEpoch: 22},
+		},
+		strictRuntimeViews: []controllermeta.SlotRuntimeView{
+			{SlotID: 2, LeaderID: 12, HasQuorum: true, ObservedConfigEpoch: 22},
+		},
+	}
+	reader := deliveryTagTopologyReaderAdapter{cluster: cluster}
+
+	_, err := reader.CurrentDeliveryTagTopology(context.Background(), []string{"u1"})
+
+	require.NoError(t, err)
+	require.True(t, cluster.strictRuntimeViewsHasDeadline)
+	remaining := time.Until(cluster.strictRuntimeViewsDeadline)
+	require.Positive(t, remaining)
+	require.LessOrEqual(t, remaining, deliveryTagStrictRuntimeViewTimeout)
 }
 
 func TestDeliveryTagTopologyReaderRejectsNonLocalSlotWithoutStableObservedLeader(t *testing.T) {
@@ -3242,6 +3306,24 @@ func (s staticDeliveryTagTopology) ValidateCurrentDeliveryTagTopology(_ context.
 	return s.version.Equal(topology), nil
 }
 
+type recordingDeliveryTagTopology struct {
+	version       deliverytagruntime.PartitionTopologyVersion
+	currentErr    error
+	validateErr   error
+	currentCalls  int
+	validateCalls int
+}
+
+func (r *recordingDeliveryTagTopology) CurrentDeliveryTagTopology(context.Context, []string) (deliverytagruntime.PartitionTopologyVersion, error) {
+	r.currentCalls++
+	return r.version.Clone(), r.currentErr
+}
+
+func (r *recordingDeliveryTagTopology) ValidateCurrentDeliveryTagTopology(_ context.Context, topology deliverytagruntime.PartitionTopologyVersion) (bool, error) {
+	r.validateCalls++
+	return r.version.Equal(topology), r.validateErr
+}
+
 type recordingDeliveryTagCluster struct {
 	slotByKey                     map[string]multiraft.SlotID
 	leaderBySlot                  map[multiraft.SlotID]multiraft.NodeID
@@ -3254,6 +3336,8 @@ type recordingDeliveryTagCluster struct {
 	cachedRuntimeViewsOK          bool
 	strictRuntimeViews            []controllermeta.SlotRuntimeView
 	strictRuntimeViewsErr         error
+	strictRuntimeViewsDeadline    time.Time
+	strictRuntimeViewsHasDeadline bool
 	listObservedRuntimeViewsCalls int
 }
 
@@ -3282,8 +3366,9 @@ func (c *recordingDeliveryTagCluster) ListCachedObservedRuntimeViews() ([]contro
 	return append([]controllermeta.SlotRuntimeView(nil), c.cachedRuntimeViews...), c.cachedRuntimeViewsOK
 }
 
-func (c *recordingDeliveryTagCluster) ListObservedRuntimeViewsStrict(context.Context) ([]controllermeta.SlotRuntimeView, error) {
+func (c *recordingDeliveryTagCluster) ListObservedRuntimeViewsStrict(ctx context.Context) ([]controllermeta.SlotRuntimeView, error) {
 	c.listObservedRuntimeViewsCalls++
+	c.strictRuntimeViewsDeadline, c.strictRuntimeViewsHasDeadline = ctx.Deadline()
 	return append([]controllermeta.SlotRuntimeView(nil), c.strictRuntimeViews...), c.strictRuntimeViewsErr
 }
 
