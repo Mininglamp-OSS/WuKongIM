@@ -24,6 +24,7 @@ type deliveryRuntimeMaintenance interface {
 
 type deliveryRuntimeMetrics interface {
 	ObserveRouteExpired(channelType string)
+	ObserveResolveAbandoned(channelType string)
 	SetActorInflightRoutes(v int)
 	SetAckBindings(v int)
 }
@@ -151,6 +152,13 @@ func (o deliveryRuntimeMetricsObserver) OnRouteExpired(event deliveryruntime.Rou
 		return
 	}
 	o.metrics.ObserveRouteExpired(deliveryChannelTypeLabel(event.ChannelType))
+}
+
+func (o deliveryRuntimeMetricsObserver) OnResolveAbandoned(event deliveryruntime.ResolveAbandonedEvent) {
+	if o.metrics == nil {
+		return
+	}
+	o.metrics.ObserveResolveAbandoned(deliveryChannelTypeLabel(event.ChannelType))
 }
 
 func (o deliveryRuntimeMetricsObserver) OnMaintenanceSnapshot(snapshot deliveryruntime.MaintenanceSnapshot) {

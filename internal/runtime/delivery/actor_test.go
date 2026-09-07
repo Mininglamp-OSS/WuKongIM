@@ -280,6 +280,29 @@ func TestActorReportsRouteExpiryObserverOutsideActorLock(t *testing.T) {
 	require.Equal(t, 1, observer.expiredCount())
 }
 
+func TestActorReportsResolveAbandonedAfterRetryExhaustion(t *testing.T) {
+	observer := &recordingDeliveryObserver{}
+	runtime := NewManager(Config{
+		Resolver: &flakyResolver{
+			failMessageIDs: map[uint64]error{101: context.DeadlineExceeded},
+		},
+		MaxRetryAttempts: 1,
+		Observer:         observer,
+	})
+
+	require.NoError(t, runtime.Submit(context.Background(), testEnvelopeFor(
+		"g-resolve-abandoned", frame.ChannelTypeGroup, 101, 7, "payload",
+	)))
+
+	require.Equal(t, []ResolveAbandonedEvent{{
+		ChannelID:   "g-resolve-abandoned",
+		ChannelType: frame.ChannelTypeGroup,
+		MessageID:   101,
+		MessageSeq:  7,
+		Attempt:     1,
+	}}, observer.abandoned)
+}
+
 func TestActorDoesNotExpireRouteAckedDuringFinalRetryPush(t *testing.T) {
 	clock := &testClock{now: time.Date(2026, 4, 29, 12, 0, 0, 0, time.UTC)}
 	observer := &recordingDeliveryObserver{}
@@ -681,11 +704,16 @@ type flakyResolveToken struct {
 }
 
 type recordingDeliveryObserver struct {
-	expired []RouteExpiredEvent
+	expired   []RouteExpiredEvent
+	abandoned []ResolveAbandonedEvent
 }
 
 func (r *recordingDeliveryObserver) OnRouteExpired(event RouteExpiredEvent) {
 	r.expired = append(r.expired, event)
+}
+
+func (r *recordingDeliveryObserver) OnResolveAbandoned(event ResolveAbandonedEvent) {
+	r.abandoned = append(r.abandoned, event)
 }
 
 func (r *recordingDeliveryObserver) OnMaintenanceSnapshot(MaintenanceSnapshot) {}
@@ -704,6 +732,8 @@ func (o *lockingDeliveryObserver) OnRouteExpired(event RouteExpiredEvent) {
 	defer o.mu.Unlock()
 	o.expired++
 }
+
+func (o *lockingDeliveryObserver) OnResolveAbandoned(ResolveAbandonedEvent) {}
 
 func (o *lockingDeliveryObserver) OnMaintenanceSnapshot(MaintenanceSnapshot) {}
 

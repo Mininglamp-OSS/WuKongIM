@@ -75,12 +75,26 @@ func TestDeliveryRuntimeObserverRecordsRouteExpiryMetric(t *testing.T) {
 	require.Equal(t, []string{"group"}, metrics.expired)
 }
 
+func TestDeliveryRuntimeObserverRecordsResolveAbandonedMetric(t *testing.T) {
+	metrics := &recordingDeliveryLifecycleMetrics{}
+	observer := deliveryRuntimeMetricsObserver{metrics: metrics}
+
+	observer.OnResolveAbandoned(deliveryruntime.ResolveAbandonedEvent{ChannelType: frame.ChannelTypeGroup})
+
+	require.Equal(t, []string{"group"}, metrics.abandoned)
+}
+
 type recordingDeliveryLifecycleMetrics struct {
-	expired []string
+	expired   []string
+	abandoned []string
 }
 
 func (m *recordingDeliveryLifecycleMetrics) ObserveRouteExpired(channelType string) {
 	m.expired = append(m.expired, channelType)
+}
+
+func (m *recordingDeliveryLifecycleMetrics) ObserveResolveAbandoned(channelType string) {
+	m.abandoned = append(m.abandoned, channelType)
 }
 
 func (m *recordingDeliveryLifecycleMetrics) SetActorInflightRoutes(int) {}

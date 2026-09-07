@@ -645,6 +645,7 @@ handleRecvAck(ctx, pkt)
 - **Actor 空闲回收**: 超过 1 分钟空闲会被回收
 - **不等待全局连续 MessageSeq**: owner routing 与 replay 会让节点只看到该 Channel 全局序列的稀疏子集，按本节点已观察到的提交流推进
 - **投递重试有上限**: 默认重试延迟 [500ms, 1s, 2s]，最大重试次数 = 4 次，超过后移除 Ack 绑定并依赖 Channel Log catch-up
+- **解析重试耗尽必须可观测**: committed message 在 subscriber resolve 阶段耗尽重试预算时递增 `wukongim_delivery_resolve_abandoned_total`，不能只记录单次 resolve error。
 - **AckIndex 是关键**: `AckIndex.Bind` 在 Push 时建立 SessionID+MessageID → Channel+Route 的映射
 - **DeliveryTag 是 Leader 权威分区快照**: Leader 构建全频道订阅者分区，Follower 仅缓存本节点分区；普通订阅者变更保持 `tagKey`、递增 `tagVersion`，陈旧 tag 响应只触发重试/刷新，不能覆盖新缓存
 - **远程实时投递只在单条 committed message 内批量**: 不跨消息聚合；按目标节点合并 RPC，Group 频道大 route 集会按 chunk 拆分，Person 频道按 recipient view 拆分 frame item；delivery push v2 响应用 accepted count 避免回显所有成功 route，滚动升级时可回退 legacy 请求/响应

@@ -1488,7 +1488,7 @@ func TestDeliveryTagTopologyReaderUsesCachedAssignmentsWithoutControllerRefresh(
 			{SlotID: 2, ConfigEpoch: 99, BalanceVersion: 99},
 		},
 	}
-	reader := deliveryTagTopologyReaderAdapter{cluster: cluster}
+	reader := newDeliveryTagTopologyReaderAdapter(cluster)
 
 	topology, err := reader.CurrentDeliveryTagTopology(context.Background(), []string{"u1", "u2", "u3"})
 
@@ -1525,7 +1525,7 @@ func TestDeliveryTagTopologyReaderUsesCachedObservedLeaderForNonLocalSlot(t *tes
 		},
 		cachedRuntimeViewsOK: true,
 	}
-	reader := deliveryTagTopologyReaderAdapter{cluster: cluster}
+	reader := newDeliveryTagTopologyReaderAdapter(cluster)
 
 	topology, err := reader.CurrentDeliveryTagTopology(context.Background(), []string{"u1", "u2"})
 
@@ -1560,7 +1560,7 @@ func TestDeliveryTagTopologyReaderRefreshesObservedLeadersOnceForNonLocalSlots(t
 			{SlotID: 2, LeaderID: 12, HasQuorum: true, ObservedConfigEpoch: 22},
 		},
 	}
-	reader := deliveryTagTopologyReaderAdapter{cluster: cluster}
+	reader := newDeliveryTagTopologyReaderAdapter(cluster)
 
 	topology, err := reader.CurrentDeliveryTagTopology(context.Background(), []string{"u1", "u2"})
 
@@ -1585,7 +1585,7 @@ func TestDeliveryTagTopologyReaderBoundsStrictRuntimeViewRefresh(t *testing.T) {
 			{SlotID: 2, LeaderID: 12, HasQuorum: true, ObservedConfigEpoch: 22},
 		},
 	}
-	reader := deliveryTagTopologyReaderAdapter{cluster: cluster}
+	reader := newDeliveryTagTopologyReaderAdapter(cluster)
 
 	_, err := reader.CurrentDeliveryTagTopology(context.Background(), []string{"u1"})
 
@@ -1596,7 +1596,7 @@ func TestDeliveryTagTopologyReaderBoundsStrictRuntimeViewRefresh(t *testing.T) {
 	require.LessOrEqual(t, remaining, deliveryTagStrictRuntimeViewTimeout)
 }
 
-func TestDeliveryTagTopologyReaderRefreshesStrictViewsAsynchronouslyAndCoalesces(t *testing.T) {
+func TestDeliveryTagTopologyReaderCoalescesConcurrentStrictRefreshWaiters(t *testing.T) {
 	release := make(chan struct{})
 	cluster := &recordingDeliveryTagCluster{
 		slotByKey: map[string]multiraft.SlotID{"u1": 2},
@@ -1614,41 +1614,35 @@ func TestDeliveryTagTopologyReaderRefreshesStrictViewsAsynchronouslyAndCoalesces
 	}
 	reader := newDeliveryTagTopologyReaderAdapter(cluster)
 
-	returned := make(chan error, 1)
+	returned := make(chan error, 6)
 	go func() {
 		_, err := reader.CurrentDeliveryTagTopology(context.Background(), []string{"u1"})
 		returned <- err
 	}()
 	select {
-	case err := <-returned:
-		require.ErrorIs(t, err, errDeliveryTagSlotLeaderUnavailable)
-	case <-time.After(100 * time.Millisecond):
-		require.FailNow(t, "topology lookup blocked on strict controller refresh")
-	}
-	select {
 	case <-cluster.strictRuntimeViewsStarted:
 	case <-time.After(time.Second):
 		require.FailNow(t, "strict controller refresh did not start")
 	}
-
 	for range 5 {
-		_, err := reader.CurrentDeliveryTagTopology(context.Background(), []string{"u1"})
-		require.ErrorIs(t, err, errDeliveryTagSlotLeaderUnavailable)
+		go func() {
+			_, err := reader.CurrentDeliveryTagTopology(context.Background(), []string{"u1"})
+			returned <- err
+		}()
 	}
 	require.Equal(t, 1, cluster.ListObservedRuntimeViewsStrictCalls())
 
 	close(release)
-	var topology deliverytagruntime.PartitionTopologyVersion
-	require.Eventually(t, func() bool {
-		current, err := reader.CurrentDeliveryTagTopology(context.Background(), []string{"u1"})
-		if err != nil {
-			return false
+	for range 6 {
+		select {
+		case err := <-returned:
+			require.NoError(t, err)
+		case <-time.After(time.Second):
+			require.FailNow(t, "topology lookup did not resume after the shared refresh")
 		}
-		topology = current
-		return true
-	}, time.Second, 10*time.Millisecond)
-	require.Equal(t, uint64(12), topology.SlotAuthorityRefs[0].LeaderNodeID)
+	}
 	require.Equal(t, 1, cluster.ListObservedRuntimeViewsStrictCalls())
+	require.True(t, cluster.strictRuntimeViewsHasDeadline)
 }
 
 func TestDeliveryTagTopologyReaderBacksOffAfterStrictRefreshFailure(t *testing.T) {
@@ -1666,17 +1660,69 @@ func TestDeliveryTagTopologyReaderBacksOffAfterStrictRefreshFailure(t *testing.T
 	reader := newDeliveryTagTopologyReaderAdapter(cluster)
 
 	_, err := reader.CurrentDeliveryTagTopology(context.Background(), []string{"u1"})
-	require.ErrorIs(t, err, errDeliveryTagSlotLeaderUnavailable)
-	require.Eventually(t, func() bool {
-		_, currentErr := reader.CurrentDeliveryTagTopology(context.Background(), []string{"u1"})
-		return errors.Is(currentErr, refreshErr)
-	}, time.Second, 10*time.Millisecond)
+	require.ErrorIs(t, err, refreshErr)
 
 	for range 5 {
 		_, err = reader.CurrentDeliveryTagTopology(context.Background(), []string{"u1"})
 		require.ErrorIs(t, err, refreshErr)
 	}
 	require.Equal(t, 1, cluster.ListObservedRuntimeViewsStrictCalls())
+}
+
+func TestDeliveryTagTopologyReaderStrictRefreshCacheCoversResolveRetryBudget(t *testing.T) {
+	cluster := &recordingDeliveryTagCluster{
+		slotByKey: map[string]multiraft.SlotID{"u1": 2},
+		leaderErrBySlot: map[multiraft.SlotID]error{
+			2: multiraft.ErrSlotNotFound,
+		},
+		cachedAssignments: []controllermeta.SlotAssignment{
+			{SlotID: 2, ConfigEpoch: 22},
+		},
+		strictRuntimeViews: []controllermeta.SlotRuntimeView{
+			{SlotID: 2, LeaderID: 12, HasQuorum: true, ObservedConfigEpoch: 22},
+		},
+	}
+	reader := newDeliveryTagTopologyReaderAdapter(cluster)
+	now := time.Unix(1, 0)
+	reader.runtimeViewRefreshes.now = func() time.Time { return now }
+
+	for _, elapsed := range []time.Duration{0, 550 * time.Millisecond, 1650 * time.Millisecond, 3850 * time.Millisecond} {
+		now = time.Unix(1, 0).Add(elapsed)
+		_, err := reader.CurrentDeliveryTagTopology(context.Background(), []string{"u1"})
+		require.NoError(t, err)
+	}
+	require.Equal(t, 1, cluster.ListObservedRuntimeViewsStrictCalls())
+}
+
+func TestDeliveryTagTopologyReaderRefreshesIncompleteStrictSnapshotAfterBackoff(t *testing.T) {
+	cluster := &recordingDeliveryTagCluster{
+		slotByKey: map[string]multiraft.SlotID{"u1": 2},
+		leaderErrBySlot: map[multiraft.SlotID]error{
+			2: multiraft.ErrSlotNotFound,
+		},
+		cachedAssignments: []controllermeta.SlotAssignment{
+			{SlotID: 2, ConfigEpoch: 22},
+		},
+	}
+	reader := newDeliveryTagTopologyReaderAdapter(cluster)
+	now := time.Unix(1, 0)
+	reader.runtimeViewRefreshes.now = func() time.Time { return now }
+
+	_, err := reader.CurrentDeliveryTagTopology(context.Background(), []string{"u1"})
+	require.ErrorIs(t, err, errDeliveryTagSlotLeaderUnavailable)
+	now = now.Add(deliveryTagStrictRuntimeViewFailureBackoff - time.Millisecond)
+	_, err = reader.CurrentDeliveryTagTopology(context.Background(), []string{"u1"})
+	require.ErrorIs(t, err, errDeliveryTagSlotLeaderUnavailable)
+	require.Equal(t, 1, cluster.ListObservedRuntimeViewsStrictCalls())
+
+	cluster.strictRuntimeViews = []controllermeta.SlotRuntimeView{
+		{SlotID: 2, LeaderID: 12, HasQuorum: true, ObservedConfigEpoch: 22},
+	}
+	now = now.Add(2 * time.Millisecond)
+	topology, err := reader.CurrentDeliveryTagTopology(context.Background(), []string{"u1"})
+	require.NoError(t, err)
+	require.Equal(t, uint64(12), topology.SlotAuthorityRefs[0].LeaderNodeID)
+	require.Equal(t, 2, cluster.ListObservedRuntimeViewsStrictCalls())
 }
 
 func TestDeliveryTagTopologyReaderRejectsNonLocalSlotWithoutStableObservedLeader(t *testing.T) {
@@ -1692,7 +1738,7 @@ func TestDeliveryTagTopologyReaderRejectsNonLocalSlotWithoutStableObservedLeader
 			{SlotID: 2, LeaderID: 12, HasQuorum: false, ObservedConfigEpoch: 22},
 		},
 	}
-	reader := deliveryTagTopologyReaderAdapter{cluster: cluster}
+	reader := newDeliveryTagTopologyReaderAdapter(cluster)
 
 	_, err := reader.CurrentDeliveryTagTopology(context.Background(), []string{"u1"})
 
@@ -1723,7 +1769,7 @@ func TestDeliveryTagTopologyReaderStrictRefreshSupersedesPartialCache(t *testing
 			{SlotID: 2, LeaderID: 12, HasQuorum: true, ObservedConfigEpoch: 22},
 		},
 	}
-	reader := deliveryTagTopologyReaderAdapter{cluster: cluster}
+	reader := newDeliveryTagTopologyReaderAdapter(cluster)
 
 	topology, err := reader.CurrentDeliveryTagTopology(context.Background(), []string{"u1", "u2"})
 
@@ -1733,6 +1779,39 @@ func TestDeliveryTagTopologyReaderStrictRefreshSupersedesPartialCache(t *testing
 		{SlotID: 2, LeaderNodeID: 12, ConfigEpoch: 22},
 	}, topology.SlotAuthorityRefs)
 	require.Equal(t, 1, cluster.ListObservedRuntimeViewsStrictCalls())
+}
+
+func TestDeliveryTagTopologyReaderPreservesCachedLeaderOmittedFromStrictSnapshot(t *testing.T) {
+	cluster := &recordingDeliveryTagCluster{
+		slotByKey: map[string]multiraft.SlotID{
+			"u1": 1,
+			"u2": 2,
+		},
+		leaderErrBySlot: map[multiraft.SlotID]error{
+			1: multiraft.ErrSlotNotFound,
+			2: multiraft.ErrSlotNotFound,
+		},
+		cachedAssignments: []controllermeta.SlotAssignment{
+			{SlotID: 1, ConfigEpoch: 21},
+			{SlotID: 2, ConfigEpoch: 22},
+		},
+		cachedRuntimeViews: []controllermeta.SlotRuntimeView{
+			{SlotID: 1, LeaderID: 11, HasQuorum: true, ObservedConfigEpoch: 21},
+		},
+		cachedRuntimeViewsOK: true,
+		strictRuntimeViews: []controllermeta.SlotRuntimeView{
+			{SlotID: 2, LeaderID: 12, HasQuorum: true, ObservedConfigEpoch: 22},
+		},
+	}
+	reader := newDeliveryTagTopologyReaderAdapter(cluster)
+
+	topology, err := reader.CurrentDeliveryTagTopology(context.Background(), []string{"u1", "u2"})
+
+	require.NoError(t, err)
+	require.Equal(t, []deliverytagruntime.SlotAuthorityRef{
+		{SlotID: 1, LeaderNodeID: 11, ConfigEpoch: 21},
+		{SlotID: 2, LeaderNodeID: 12, ConfigEpoch: 22},
+	}, topology.SlotAuthorityRefs)
 }
 
 func TestDeliveryTagTopologyReaderRefreshesStaleObservedConfigEpoch(t *testing.T) {
@@ -1752,7 +1831,7 @@ func TestDeliveryTagTopologyReaderRefreshesStaleObservedConfigEpoch(t *testing.T
 			{SlotID: 2, LeaderID: 13, HasQuorum: true, ObservedConfigEpoch: 22},
 		},
 	}
-	reader := deliveryTagTopologyReaderAdapter{cluster: cluster}
+	reader := newDeliveryTagTopologyReaderAdapter(cluster)
 
 	topology, err := reader.CurrentDeliveryTagTopology(context.Background(), []string{"u1"})
 
@@ -1797,7 +1876,7 @@ func TestDeliveryTagTopologyValidatorUsesCachedAssignmentsWithoutControllerRefre
 			{SlotID: 2, ConfigEpoch: 99, BalanceVersion: 99},
 		},
 	}
-	reader := deliveryTagTopologyReaderAdapter{cluster: cluster}
+	reader := newDeliveryTagTopologyReaderAdapter(cluster)
 	topology := deliverytagruntime.PartitionTopologyVersion{
 		HashSlotTableVersion: 9,
 		SlotAuthorityRefs: []deliverytagruntime.SlotAuthorityRef{
@@ -1827,7 +1906,7 @@ func TestDeliveryTagTopologyValidatorUsesObservedLeaderForNonLocalSlot(t *testin
 		},
 		cachedRuntimeViewsOK: true,
 	}
-	reader := deliveryTagTopologyReaderAdapter{cluster: cluster}
+	reader := newDeliveryTagTopologyReaderAdapter(cluster)
 	topology := deliverytagruntime.PartitionTopologyVersion{
 		HashSlotTableVersion: 9,
 		SlotAuthorityRefs: []deliverytagruntime.SlotAuthorityRef{
@@ -1853,7 +1932,7 @@ func TestDeliveryTagTopologyReaderFallsBackToListingAssignmentsWhenCacheMisses(t
 			{SlotID: 1, ConfigEpoch: 21, BalanceVersion: 31},
 		},
 	}
-	reader := deliveryTagTopologyReaderAdapter{cluster: cluster}
+	reader := newDeliveryTagTopologyReaderAdapter(cluster)
 
 	topology, err := reader.CurrentDeliveryTagTopology(context.Background(), []string{"u1"})
 
