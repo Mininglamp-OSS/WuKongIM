@@ -3883,7 +3883,7 @@ func (c *recordingDeliveryTagCluster) ListObservedRuntimeViewsStrict(ctx context
 	return views, err
 }
 
-func (c *recordingDeliveryTagCluster) ListSlotAssignments(context.Context) ([]controllermeta.SlotAssignment, error) {
+func (c *recordingDeliveryTagCluster) ListSlotAssignmentsStrict(context.Context) ([]controllermeta.SlotAssignment, error) {
 	c.listAssignmentsCalls++
 	return append([]controllermeta.SlotAssignment(nil), c.listAssignments...), c.listAssignmentsErr
 }

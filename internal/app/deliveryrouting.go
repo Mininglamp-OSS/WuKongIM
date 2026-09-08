@@ -684,7 +684,7 @@ type deliveryTagCluster interface {
 	SlotForKey(key string) multiraft.SlotID
 	HashSlotTableVersion() uint64
 	LeaderOf(slotID multiraft.SlotID) (multiraft.NodeID, error)
-	ListSlotAssignments(ctx context.Context) ([]controllermeta.SlotAssignment, error)
+	ListSlotAssignmentsStrict(ctx context.Context) ([]controllermeta.SlotAssignment, error)
 	ListObservedRuntimeViewsStrict(ctx context.Context) ([]controllermeta.SlotRuntimeView, error)
 }
 
@@ -1095,7 +1095,7 @@ func currentDeliveryTagAssignmentBySlot(ctx context.Context, cluster deliveryTag
 			return cachedAssignments, nil
 		}
 	}
-	assignments, err := cluster.ListSlotAssignments(ctx)
+	assignments, err := cluster.ListSlotAssignmentsStrict(ctx)
 	if err != nil {
 		return cachedAssignments, err
 	}
