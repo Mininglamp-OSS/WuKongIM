@@ -28,6 +28,7 @@ type actor struct {
 	completed       map[uint64]struct{}
 	completedOrder  []uint64
 	expiredEvents   []RouteExpiredEvent
+	abandonedEvents []ResolveAbandonedEvent
 	offlineEvents   []OfflineResolvedEvent
 	lastActive      int64
 }
@@ -274,6 +275,13 @@ func (a *actor) handleResolveFailure(_ context.Context, msg *InflightMessage) (b
 	if !ok {
 		msg.ResolveDone = true
 		msg.ResolveRetryAt = time.Time{}
+		a.abandonedEvents = append(a.abandonedEvents, ResolveAbandonedEvent{
+			ChannelID:   a.key.ChannelID,
+			ChannelType: a.key.ChannelType,
+			MessageID:   msg.MessageID,
+			MessageSeq:  msg.MessageSeq,
+			Attempt:     msg.ResolveAttempt,
+		})
 		if msg.PendingRouteCnt == 0 {
 			a.completeMessage(msg.MessageID)
 		}
@@ -436,6 +444,15 @@ func (a *actor) drainExpiredEventsLocked() []RouteExpiredEvent {
 	}
 	events := append([]RouteExpiredEvent(nil), a.expiredEvents...)
 	a.expiredEvents = a.expiredEvents[:0]
+	return events
+}
+
+func (a *actor) drainResolveAbandonedEventsLocked() []ResolveAbandonedEvent {
+	if len(a.abandonedEvents) == 0 {
+		return nil
+	}
+	events := append([]ResolveAbandonedEvent(nil), a.abandonedEvents...)
+	a.abandonedEvents = a.abandonedEvents[:0]
 	return events
 }
 

@@ -6,6 +6,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -15,10 +16,12 @@ import (
 
 	runtimechannelmeta "github.com/WuKongIM/WuKongIM/internal/runtime/channelmeta"
 	deliveryruntime "github.com/WuKongIM/WuKongIM/internal/runtime/delivery"
+	deliverytagruntime "github.com/WuKongIM/WuKongIM/internal/runtime/deliverytag"
 	deliveryusecase "github.com/WuKongIM/WuKongIM/internal/usecase/delivery"
 	messageusecase "github.com/WuKongIM/WuKongIM/internal/usecase/message"
 	"github.com/WuKongIM/WuKongIM/pkg/channel"
 	channelhandler "github.com/WuKongIM/WuKongIM/pkg/channel/handler"
+	controllermeta "github.com/WuKongIM/WuKongIM/pkg/controller/meta"
 	metadb "github.com/WuKongIM/WuKongIM/pkg/db/meta"
 	"github.com/WuKongIM/WuKongIM/pkg/protocol/frame"
 	"github.com/WuKongIM/WuKongIM/pkg/slot/multiraft"
@@ -74,6 +77,112 @@ func TestAppManagedSlotStartupAllowsSubsetAssignmentsPerNode(t *testing.T) {
 		}
 		return true
 	}, 10*time.Second, 50*time.Millisecond)
+}
+
+func TestDeliveryTagTopologyResolvesNonLocalSlotInFiveNodeCluster(t *testing.T) {
+	harness := newFiveNodeManagedAppHarnessWithLayout(t, 2, 3)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	var assignments []controllermeta.SlotAssignment
+	require.Eventually(t, func() bool {
+		for _, app := range harness.apps {
+			current, err := app.Cluster().ListSlotAssignments(ctx)
+			if err == nil && len(current) == 2 {
+				assignments = current
+				return true
+			}
+		}
+		return false
+	}, 15*time.Second, 50*time.Millisecond)
+
+	var controllerLeaderID uint64
+	require.Eventually(t, func() bool {
+		for _, app := range harness.apps {
+			if leaderID := app.Cluster().ControllerLeaderID(); leaderID != 0 {
+				controllerLeaderID = leaderID
+				return true
+			}
+		}
+		return false
+	}, 10*time.Second, 50*time.Millisecond)
+
+	var (
+		materializer     *App
+		targetAssignment controllermeta.SlotAssignment
+	)
+	for _, assignment := range assignments {
+		for nodeID, app := range harness.apps {
+			if app == nil || nodeID == controllerLeaderID {
+				continue
+			}
+			assigned := false
+			for _, peer := range assignment.DesiredPeers {
+				if peer == nodeID {
+					assigned = true
+					break
+				}
+			}
+			if !assigned {
+				materializer = app
+				targetAssignment = assignment
+				break
+			}
+		}
+		if materializer != nil {
+			break
+		}
+	}
+	require.NotNil(t, materializer, "expected a non-leader node outside a three-replica Slot assignment")
+
+	require.Eventually(t, func() bool {
+		_, err := materializer.Cluster().LeaderOf(multiraft.SlotID(targetAssignment.SlotID))
+		return errors.Is(err, multiraft.ErrSlotNotFound)
+	}, 15*time.Second, 50*time.Millisecond)
+
+	var expectedLeader multiraft.NodeID
+	require.Eventually(t, func() bool {
+		for _, peer := range targetAssignment.DesiredPeers {
+			app := harness.apps[peer]
+			if app == nil {
+				continue
+			}
+			leaderID, err := app.Cluster().LeaderOf(multiraft.SlotID(targetAssignment.SlotID))
+			if err == nil && leaderID != 0 {
+				expectedLeader = leaderID
+				return true
+			}
+		}
+		return false
+	}, 15*time.Second, 50*time.Millisecond)
+
+	var subscriberUID string
+	for i := 0; i < 10_000; i++ {
+		candidate := fmt.Sprintf("delivery-tag-non-local-%d", i)
+		if uint32(materializer.Cluster().SlotForKey(candidate)) == targetAssignment.SlotID {
+			subscriberUID = candidate
+			break
+		}
+	}
+	require.NotEmpty(t, subscriberUID)
+
+	reader := newDeliveryTagTopologyReaderAdapter(materializer.Cluster())
+	var topology deliverytagruntime.PartitionTopologyVersion
+	require.Eventually(t, func() bool {
+		current, err := reader.CurrentDeliveryTagTopology(ctx, []string{subscriberUID})
+		if err != nil {
+			return false
+		}
+		topology = current
+		return true
+	}, 10*time.Second, 100*time.Millisecond)
+
+	require.Equal(t, []deliverytagruntime.SlotAuthorityRef{{
+		SlotID:         targetAssignment.SlotID,
+		LeaderNodeID:   uint64(expectedLeader),
+		ConfigEpoch:    targetAssignment.ConfigEpoch,
+		BalanceVersion: targetAssignment.BalanceVersion,
+	}}, topology.SlotAuthorityRefs)
 }
 
 func TestSlotLeaderChangeDoesNotDriftHealthyChannelLeader(t *testing.T) {

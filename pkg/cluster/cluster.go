@@ -1546,6 +1546,24 @@ func (c *Cluster) ListObservedRuntimeViews(ctx context.Context) ([]controllermet
 	return nil, ErrNotStarted
 }
 
+// ListCachedObservedRuntimeViews returns the latest controller-leader runtime
+// view already applied on this node without issuing a controller RPC.
+func (c *Cluster) ListCachedObservedRuntimeViews() ([]controllermeta.SlotRuntimeView, bool) {
+	if c == nil {
+		return nil, false
+	}
+	if c.controllerHost != nil && c.controllerHost.IsLeader(c.cfg.NodeID) {
+		if !c.controllerHost.warmupComplete() {
+			return nil, false
+		}
+		return c.controllerHost.snapshotObservations().RuntimeViews, true
+	}
+	if c.agent != nil {
+		return c.agent.appliedObservationRuntimeViews()
+	}
+	return nil, false
+}
+
 // ListObservedRuntimeViewsStrict returns the controller leader's observed runtime snapshot without local fallback.
 func (c *Cluster) ListObservedRuntimeViewsStrict(ctx context.Context) ([]controllermeta.SlotRuntimeView, error) {
 	if views, ok, err := c.localObservedRuntimeViewsStrict(); ok || err != nil {

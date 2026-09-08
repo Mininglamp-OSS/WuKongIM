@@ -83,6 +83,15 @@ type RouteExpiredEvent struct {
 	Attempt     int
 }
 
+// ResolveAbandonedEvent describes a committed message whose subscriber resolution exhausted its retry budget.
+type ResolveAbandonedEvent struct {
+	ChannelID   string
+	ChannelType uint8
+	MessageID   uint64
+	MessageSeq  uint64
+	Attempt     int
+}
+
 // MaintenanceSnapshot captures delivery runtime gauge values after maintenance passes.
 type MaintenanceSnapshot struct {
 	InflightRoutes int
@@ -92,6 +101,7 @@ type MaintenanceSnapshot struct {
 // Observer receives delivery runtime lifecycle and route expiry notifications.
 type Observer interface {
 	OnRouteExpired(RouteExpiredEvent)
+	OnResolveAbandoned(ResolveAbandonedEvent)
 	OnMaintenanceSnapshot(MaintenanceSnapshot)
 }
 

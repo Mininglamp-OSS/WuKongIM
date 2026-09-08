@@ -841,6 +841,37 @@ func TestListObservedRuntimeViewsFallsBackToLocalControllerMetaWhenLeaderUnavail
 	}
 }
 
+func TestListCachedObservedRuntimeViewsUsesFollowerAppliedSnapshot(t *testing.T) {
+	cluster := &Cluster{}
+	cluster.agent = &slotAgent{
+		observationState: observationAppliedState{
+			LeaderGeneration: 3,
+			RuntimeViews: map[uint32]controllermeta.SlotRuntimeView{
+				7: {SlotID: 7, LeaderID: 2, HasQuorum: true},
+			},
+		},
+	}
+
+	views, ok := cluster.ListCachedObservedRuntimeViews()
+
+	if !ok {
+		t.Fatal("ListCachedObservedRuntimeViews() ok = false, want true")
+	}
+	if len(views) != 1 || views[0].SlotID != 7 || views[0].LeaderID != 2 {
+		t.Fatalf("ListCachedObservedRuntimeViews() = %v, want slot 7 leader 2", views)
+	}
+}
+
+func TestListCachedObservedRuntimeViewsUnavailableBeforeFollowerSync(t *testing.T) {
+	cluster := &Cluster{agentResources: agentResources{agent: &slotAgent{}}}
+
+	views, ok := cluster.ListCachedObservedRuntimeViews()
+
+	if ok || views != nil {
+		t.Fatalf("ListCachedObservedRuntimeViews() = (%v, %v), want (nil, false)", views, ok)
+	}
+}
+
 func TestListObservedRuntimeViewsFallsBackToLocalControllerMetaWhenControllerReadTimesOut(t *testing.T) {
 	dir := t.TempDir()
 	store, err := controllermeta.Open(filepath.Join(dir, "controller-meta"))

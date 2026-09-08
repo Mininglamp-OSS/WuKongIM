@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
 	"hash/fnv"
 	"io"
 	"runtime"
@@ -23,6 +24,7 @@ import (
 	"github.com/WuKongIM/WuKongIM/internal/usecase/message"
 	"github.com/WuKongIM/WuKongIM/internal/usecase/presence"
 	"github.com/WuKongIM/WuKongIM/pkg/channel"
+	raftcluster "github.com/WuKongIM/WuKongIM/pkg/cluster"
 	controllermeta "github.com/WuKongIM/WuKongIM/pkg/controller/meta"
 	"github.com/WuKongIM/WuKongIM/pkg/protocol/codec"
 	"github.com/WuKongIM/WuKongIM/pkg/protocol/frame"
@@ -31,12 +33,13 @@ import (
 )
 
 var (
-	errRemoteAckNotifierRequired       = errors.New("app: remote ack notifier required")
-	errRemoteOfflineNotifierRequired   = errors.New("app: remote offline notifier required")
-	errCommittedDispatcherStopped      = errors.New("app: committed dispatcher stopped")
-	errMessageScopedDeliveryRequired   = errors.New("app: message scoped committed delivery required")
-	errMessageScopedOwnerRequired      = errors.New("app: message scoped committed owner required")
-	errMessageScopedNodeClientRequired = errors.New("app: message scoped committed node client required")
+	errRemoteAckNotifierRequired        = errors.New("app: remote ack notifier required")
+	errRemoteOfflineNotifierRequired    = errors.New("app: remote offline notifier required")
+	errCommittedDispatcherStopped       = errors.New("app: committed dispatcher stopped")
+	errMessageScopedDeliveryRequired    = errors.New("app: message scoped committed delivery required")
+	errMessageScopedOwnerRequired       = errors.New("app: message scoped committed owner required")
+	errMessageScopedNodeClientRequired  = errors.New("app: message scoped committed node client required")
+	errDeliveryTagSlotLeaderUnavailable = errors.New("app: delivery tag slot leader unavailable")
 )
 
 const (
@@ -50,6 +53,12 @@ const (
 
 	// deliveryPushRouteChunkSize bounds the route list carried by one remote push RPC.
 	deliveryPushRouteChunkSize = 1000
+	// deliveryTagStrictRuntimeViewTimeout keeps a controller refresh below the first delivery retry interval.
+	deliveryTagStrictRuntimeViewTimeout = 500 * time.Millisecond
+	// deliveryTagStrictRuntimeViewCacheTTL outlives the default delivery resolve retry budget.
+	deliveryTagStrictRuntimeViewCacheTTL = 5 * time.Second
+	// deliveryTagStrictRuntimeViewFailureBackoff prevents one controller failure per queued message.
+	deliveryTagStrictRuntimeViewFailureBackoff = 500 * time.Millisecond
 
 	deliveryTagRPCStatusOK              = "ok"
 	deliveryTagRPCStatusRetryable       = "retryable"
@@ -675,12 +684,20 @@ type deliveryTagCluster interface {
 	HashSlotTableVersion() uint64
 	LeaderOf(slotID multiraft.SlotID) (multiraft.NodeID, error)
 	ListSlotAssignments(ctx context.Context) ([]controllermeta.SlotAssignment, error)
+	ListObservedRuntimeViewsStrict(ctx context.Context) ([]controllermeta.SlotRuntimeView, error)
 }
 
 type cachedDeliveryTagAssignments interface {
 	// ListCachedAssignments returns the node-local controller assignment snapshot without refreshing the controller leader.
 	ListCachedAssignments() []controllermeta.SlotAssignment
 }
+
+type cachedDeliveryTagRuntimeViews interface {
+	// ListCachedObservedRuntimeViews returns the latest controller-leader runtime view applied on this node.
+	ListCachedObservedRuntimeViews() ([]controllermeta.SlotRuntimeView, bool)
+}
+
+var _ cachedDeliveryTagRuntimeViews = (*raftcluster.Cluster)(nil)
 
 // tagDeliveryResolver resolves routes from leader-built delivery tag partitions.
 type tagDeliveryResolver struct {
@@ -723,7 +740,27 @@ func (a deliveryTagAuthority) UpdateDeliveryTag(_ context.Context, req accessnod
 }
 
 type deliveryTagTopologyReaderAdapter struct {
-	cluster deliveryTagCluster
+	cluster              deliveryTagCluster
+	runtimeViewRefreshes *deliveryTagRuntimeViewRefreshCoordinator
+}
+
+// deliveryTagRuntimeViewRefreshCoordinator keeps strict controller reads off the
+// synchronous delivery path and coalesces refreshes across concurrent messages.
+type deliveryTagRuntimeViewRefreshCoordinator struct {
+	mu        sync.Mutex
+	inFlight  bool
+	done      chan struct{}
+	views     []controllermeta.SlotRuntimeView
+	err       error
+	expiresAt time.Time
+	now       func() time.Time
+}
+
+func newDeliveryTagTopologyReaderAdapter(cluster deliveryTagCluster) deliveryTagTopologyReaderAdapter {
+	return deliveryTagTopologyReaderAdapter{
+		cluster:              cluster,
+		runtimeViewRefreshes: &deliveryTagRuntimeViewRefreshCoordinator{now: time.Now},
+	}
 }
 
 func (r deliveryTagTopologyReaderAdapter) CurrentDeliveryTagTopology(ctx context.Context, uids []string) (deliverytagruntime.PartitionTopologyVersion, error) {
@@ -740,16 +777,16 @@ func (r deliveryTagTopologyReaderAdapter) CurrentDeliveryTagTopology(ctx context
 	}
 	sort.Slice(slotIDs, func(i, j int) bool { return slotIDs[i] < slotIDs[j] })
 	assignmentBySlot := currentDeliveryTagAssignmentBySlot(ctx, r.cluster, slotIDs)
+	leaderBySlot, err := currentDeliveryTagLeaderBySlot(ctx, r.cluster, r.runtimeViewRefreshes, slotIDs, assignmentBySlot)
+	if err != nil {
+		return deliverytagruntime.PartitionTopologyVersion{}, err
+	}
 	refs := make([]deliverytagruntime.SlotAuthorityRef, 0, len(slotIDs))
 	for _, slotID := range slotIDs {
-		leaderID, err := r.cluster.LeaderOf(multiraft.SlotID(slotID))
-		if err != nil {
-			return deliverytagruntime.PartitionTopologyVersion{}, err
-		}
 		assignment := assignmentBySlot[slotID]
 		refs = append(refs, deliverytagruntime.SlotAuthorityRef{
 			SlotID:         slotID,
-			LeaderNodeID:   uint64(leaderID),
+			LeaderNodeID:   leaderBySlot[slotID],
 			ConfigEpoch:    assignment.ConfigEpoch,
 			BalanceVersion: assignment.BalanceVersion,
 		})
@@ -775,20 +812,225 @@ func (r deliveryTagTopologyReaderAdapter) ValidateCurrentDeliveryTagTopology(ctx
 		slotIDs = append(slotIDs, ref.SlotID)
 	}
 	assignmentBySlot := currentDeliveryTagAssignmentBySlot(ctx, r.cluster, slotIDs)
+	leaderBySlot, err := currentDeliveryTagLeaderBySlot(ctx, r.cluster, r.runtimeViewRefreshes, slotIDs, assignmentBySlot)
+	if err != nil {
+		return false, err
+	}
 	for _, ref := range topology.SlotAuthorityRefs {
-		leaderID, err := r.cluster.LeaderOf(multiraft.SlotID(ref.SlotID))
-		if err != nil {
-			return false, err
-		}
 		assignment, ok := assignmentBySlot[ref.SlotID]
 		if !ok {
 			return false, nil
 		}
-		if uint64(leaderID) != ref.LeaderNodeID || assignment.ConfigEpoch != ref.ConfigEpoch || assignment.BalanceVersion != ref.BalanceVersion {
+		if leaderBySlot[ref.SlotID] != ref.LeaderNodeID || assignment.ConfigEpoch != ref.ConfigEpoch || assignment.BalanceVersion != ref.BalanceVersion {
 			return false, nil
 		}
 	}
 	return true, nil
+}
+
+func currentDeliveryTagLeaderBySlot(ctx context.Context, cluster deliveryTagCluster, runtimeViewRefreshes *deliveryTagRuntimeViewRefreshCoordinator, requiredSlotIDs []uint32, assignmentBySlot map[uint32]controllermeta.SlotAssignment) (map[uint32]uint64, error) {
+	localLeaderBySlot := make(map[uint32]uint64, len(requiredSlotIDs))
+	for _, slotID := range requiredSlotIDs {
+		leaderID, err := cluster.LeaderOf(multiraft.SlotID(slotID))
+		if err == nil && leaderID != 0 {
+			localLeaderBySlot[slotID] = uint64(leaderID)
+		}
+	}
+	leaderBySlot := cloneDeliveryTagLeaderMap(localLeaderBySlot)
+	if deliveryTagLeaderMapCoversSlots(leaderBySlot, requiredSlotIDs) {
+		return leaderBySlot, nil
+	}
+
+	if cached, ok := cluster.(cachedDeliveryTagRuntimeViews); ok {
+		if views, available := cached.ListCachedObservedRuntimeViews(); available {
+			mergeDeliveryTagObservedLeaders(leaderBySlot, views, requiredSlotIDs, assignmentBySlot)
+		}
+	}
+	if deliveryTagLeaderMapCoversSlots(leaderBySlot, requiredSlotIDs) {
+		return leaderBySlot, nil
+	}
+
+	if runtimeViewRefreshes == nil {
+		return nil, errors.New("app: delivery tag runtime view refresh coordinator required")
+	}
+	views, refreshed, err := runtimeViewRefreshes.loadOrRefresh(ctx, cluster)
+	if err != nil {
+		return nil, err
+	}
+	if refreshed {
+		// A fresh strict read supersedes cached observations only with a usable leader,
+		// while preserving local leaders and cached coverage for unresolved slots.
+		mergeDeliveryTagStrictObservedLeaders(leaderBySlot, localLeaderBySlot, views, requiredSlotIDs, assignmentBySlot)
+	} else {
+		// A coordinator cache hit may be older than this node's applied observation.
+		mergeDeliveryTagObservedLeaders(leaderBySlot, views, requiredSlotIDs, assignmentBySlot)
+	}
+	if err := deliveryTagMissingSlotLeaderError(leaderBySlot, requiredSlotIDs); err != nil {
+		runtimeViewRefreshes.markIncomplete()
+		return nil, err
+	}
+	return leaderBySlot, nil
+}
+
+func (c *deliveryTagRuntimeViewRefreshCoordinator) loadOrRefresh(ctx context.Context, cluster deliveryTagCluster) ([]controllermeta.SlotRuntimeView, bool, error) {
+	if c == nil {
+		return nil, false, errors.New("app: delivery tag runtime view refresh coordinator required")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for {
+		now := c.nowTime()
+		c.mu.Lock()
+		if now.Before(c.expiresAt) {
+			views := cloneDeliveryTagRuntimeViews(c.views)
+			err := c.err
+			c.mu.Unlock()
+			return views, false, err
+		}
+		if c.inFlight {
+			done := c.done
+			c.mu.Unlock()
+			waitCtx, cancel := context.WithTimeout(ctx, deliveryTagStrictRuntimeViewTimeout)
+			select {
+			case <-done:
+				cancel()
+				continue
+			case <-waitCtx.Done():
+				err := waitCtx.Err()
+				cancel()
+				return nil, false, err
+			}
+		}
+		c.inFlight = true
+		c.done = make(chan struct{})
+		done := c.done
+		c.mu.Unlock()
+
+		refreshCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), deliveryTagStrictRuntimeViewTimeout)
+		views, err := cluster.ListObservedRuntimeViewsStrict(refreshCtx)
+		cancel()
+
+		ttl := deliveryTagStrictRuntimeViewCacheTTL
+		if err != nil {
+			ttl = deliveryTagStrictRuntimeViewFailureBackoff
+		}
+		c.mu.Lock()
+		if err == nil {
+			c.views = cloneDeliveryTagRuntimeViews(views)
+			c.err = nil
+			c.expiresAt = c.nowTime().Add(ttl)
+		} else if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			c.views = nil
+			c.err = nil
+			c.expiresAt = time.Time{}
+		} else {
+			c.views = nil
+			c.err = err
+			c.expiresAt = c.nowTime().Add(ttl)
+		}
+		c.inFlight = false
+		close(done)
+		c.done = nil
+		c.mu.Unlock()
+		return cloneDeliveryTagRuntimeViews(views), true, err
+	}
+}
+
+func (c *deliveryTagRuntimeViewRefreshCoordinator) markIncomplete() {
+	if c == nil {
+		return
+	}
+	expiresAt := c.nowTime().Add(deliveryTagStrictRuntimeViewFailureBackoff)
+	c.mu.Lock()
+	if c.expiresAt.After(expiresAt) {
+		c.expiresAt = expiresAt
+	}
+	c.mu.Unlock()
+}
+
+func (c *deliveryTagRuntimeViewRefreshCoordinator) nowTime() time.Time {
+	if c.now != nil {
+		return c.now()
+	}
+	return time.Now()
+}
+
+func cloneDeliveryTagRuntimeViews(views []controllermeta.SlotRuntimeView) []controllermeta.SlotRuntimeView {
+	if len(views) == 0 {
+		return nil
+	}
+	out := make([]controllermeta.SlotRuntimeView, len(views))
+	for i, view := range views {
+		out[i] = view
+		out[i].CurrentPeers = append([]uint64(nil), view.CurrentPeers...)
+		out[i].CurrentVoters = append([]uint64(nil), view.CurrentVoters...)
+	}
+	return out
+}
+
+func deliveryTagMissingSlotLeaderError(leaderBySlot map[uint32]uint64, requiredSlotIDs []uint32) error {
+	for _, slotID := range requiredSlotIDs {
+		if leaderBySlot[slotID] == 0 {
+			return fmt.Errorf("%w: slot_id=%d", errDeliveryTagSlotLeaderUnavailable, slotID)
+		}
+	}
+	return nil
+}
+
+func mergeDeliveryTagObservedLeaders(leaderBySlot map[uint32]uint64, views []controllermeta.SlotRuntimeView, requiredSlotIDs []uint32, assignmentBySlot map[uint32]controllermeta.SlotAssignment) {
+	requiredSlotSet := make(map[uint32]struct{}, len(requiredSlotIDs))
+	for _, slotID := range requiredSlotIDs {
+		requiredSlotSet[slotID] = struct{}{}
+	}
+	for _, view := range views {
+		if _, required := requiredSlotSet[view.SlotID]; !required {
+			continue
+		}
+		if leaderBySlot[view.SlotID] != 0 || view.LeaderID == 0 || !view.HasQuorum {
+			continue
+		}
+		if assignment, ok := assignmentBySlot[view.SlotID]; ok && assignment.ConfigEpoch != 0 && view.ObservedConfigEpoch < assignment.ConfigEpoch {
+			continue
+		}
+		leaderBySlot[view.SlotID] = view.LeaderID
+	}
+}
+
+func mergeDeliveryTagStrictObservedLeaders(leaderBySlot map[uint32]uint64, localLeaderBySlot map[uint32]uint64, views []controllermeta.SlotRuntimeView, requiredSlotIDs []uint32, assignmentBySlot map[uint32]controllermeta.SlotAssignment) {
+	requiredSlotSet := make(map[uint32]struct{}, len(requiredSlotIDs))
+	for _, slotID := range requiredSlotIDs {
+		requiredSlotSet[slotID] = struct{}{}
+	}
+	for _, view := range views {
+		if _, required := requiredSlotSet[view.SlotID]; !required || localLeaderBySlot[view.SlotID] != 0 {
+			continue
+		}
+		if view.LeaderID == 0 || !view.HasQuorum {
+			continue
+		}
+		if assignment, ok := assignmentBySlot[view.SlotID]; ok && assignment.ConfigEpoch != 0 && view.ObservedConfigEpoch < assignment.ConfigEpoch {
+			continue
+		}
+		leaderBySlot[view.SlotID] = view.LeaderID
+	}
+}
+
+func cloneDeliveryTagLeaderMap(in map[uint32]uint64) map[uint32]uint64 {
+	out := make(map[uint32]uint64, len(in))
+	for slotID, leaderID := range in {
+		out[slotID] = leaderID
+	}
+	return out
+}
+
+func deliveryTagLeaderMapCoversSlots(leaderBySlot map[uint32]uint64, requiredSlotIDs []uint32) bool {
+	for _, slotID := range requiredSlotIDs {
+		if leaderBySlot[slotID] == 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func currentDeliveryTagAssignmentBySlot(ctx context.Context, cluster deliveryTagCluster, requiredSlotIDs []uint32) map[uint32]controllermeta.SlotAssignment {
@@ -1244,18 +1486,23 @@ func (r tagDeliveryResolver) leaderTagFromSnapshot(ctx context.Context, key deli
 	source := snapshot.Source()
 	if deliveryTagCanUseCachedTagFastPath(source) {
 		if ref, ok := r.tags.CurrentRef(channelKey); ok {
-			if validator, ok := r.topology.(deliveryTagTopologyValidator); ok {
-				valid, err := validator.ValidateCurrentDeliveryTagTopology(ctx, ref.Topology)
-				if err == nil && valid {
-					if tag, hit, reason := r.tags.LookupLocalPartitionRef(deliverytagruntime.TagRef{
-						ChannelKey:                      channelKey,
-						TagKey:                          ref.TagKey,
-						TagVersion:                      ref.TagVersion,
-						SubscriberMutationVersion:       source.SubscriberMutationVersion,
-						SourceChannelKey:                deliveryTagSourceChannelKey(source),
-						SourceSubscriberMutationVersion: source.SourceSubscriberMutationVersion,
-						Topology:                        ref.Topology,
-					}); hit || reason == deliverytagruntime.LookupStaleRequest {
+			tag, hit, reason := r.tags.LookupLocalPartitionRef(deliverytagruntime.TagRef{
+				ChannelKey:                      channelKey,
+				TagKey:                          ref.TagKey,
+				TagVersion:                      ref.TagVersion,
+				SubscriberMutationVersion:       source.SubscriberMutationVersion,
+				SourceChannelKey:                deliveryTagSourceChannelKey(source),
+				SourceSubscriberMutationVersion: source.SourceSubscriberMutationVersion,
+				Topology:                        ref.Topology,
+			})
+			if hit || reason == deliverytagruntime.LookupStaleRequest {
+				if validator, ok := r.topology.(deliveryTagTopologyValidator); ok {
+					valid, err := validator.ValidateCurrentDeliveryTagTopology(ctx, tag.Topology)
+					if err != nil {
+						if hit {
+							return deliverytagruntime.DeliveryTag{}, err
+						}
+					} else if valid {
 						return tag, nil
 					}
 				}

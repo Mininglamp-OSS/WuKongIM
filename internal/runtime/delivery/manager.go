@@ -143,6 +143,15 @@ func (m *Manager) notifyRouteExpired(events []RouteExpiredEvent) {
 	}
 }
 
+func (m *Manager) notifyResolveAbandoned(events []ResolveAbandonedEvent) {
+	if m == nil || m.observer == nil {
+		return
+	}
+	for _, event := range events {
+		m.observer.OnResolveAbandoned(event)
+	}
+}
+
 func (m *Manager) notifyOfflineResolved(ctx context.Context, events []OfflineResolvedEvent) {
 	if m == nil || m.offlineResolvedObserver == nil {
 		return

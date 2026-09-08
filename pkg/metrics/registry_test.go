@@ -441,6 +441,7 @@ func TestRegistryExposesDeliveryMetrics(t *testing.T) {
 	reg.Delivery.SetActorInflightRoutes(9)
 	reg.Delivery.SetAckBindings(5)
 	reg.Delivery.ObserveRouteExpired("group")
+	reg.Delivery.ObserveResolveAbandoned("group")
 
 	families, err := reg.Gather()
 	require.NoError(t, err)
@@ -453,6 +454,7 @@ func TestRegistryExposesDeliveryMetrics(t *testing.T) {
 	requireMetricFamily(t, families, "wukongim_delivery_actor_inflight_routes")
 	requireMetricFamily(t, families, "wukongim_delivery_ack_bindings")
 	requireMetricFamily(t, families, "wukongim_delivery_route_expired_total")
+	requireMetricFamily(t, families, "wukongim_delivery_resolve_abandoned_total")
 }
 
 func TestRegistryIncludesDiagnosticsMetrics(t *testing.T) {

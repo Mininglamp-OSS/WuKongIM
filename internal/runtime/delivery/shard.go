@@ -31,9 +31,11 @@ func (s *shard) submit(ctx context.Context, env CommittedEnvelope) error {
 	s.mu.Unlock()
 	err := act.handleStartDispatch(ctx, env)
 	events := act.drainExpiredEventsLocked()
+	abandonedEvents := act.drainResolveAbandonedEventsLocked()
 	offlineEvents := act.drainOfflineResolvedEventsLocked()
 	act.mu.Unlock()
 	s.manager.notifyRouteExpired(events)
+	s.manager.notifyResolveAbandoned(abandonedEvents)
 	s.manager.notifyOfflineResolved(ctx, offlineEvents)
 	return err
 }
@@ -51,9 +53,11 @@ func (s *shard) routeAcked(ctx context.Context, binding AckBinding) error {
 		Route:     binding.Route,
 	})
 	events := act.drainExpiredEventsLocked()
+	abandonedEvents := act.drainResolveAbandonedEventsLocked()
 	offlineEvents := act.drainOfflineResolvedEventsLocked()
 	act.mu.Unlock()
 	s.manager.notifyRouteExpired(events)
+	s.manager.notifyResolveAbandoned(abandonedEvents)
 	s.manager.notifyOfflineResolved(ctx, offlineEvents)
 	return err
 }
@@ -71,9 +75,11 @@ func (s *shard) routeOffline(ctx context.Context, binding AckBinding) error {
 		Route:     binding.Route,
 	})
 	events := act.drainExpiredEventsLocked()
+	abandonedEvents := act.drainResolveAbandonedEventsLocked()
 	offlineEvents := act.drainOfflineResolvedEventsLocked()
 	act.mu.Unlock()
 	s.manager.notifyRouteExpired(events)
+	s.manager.notifyResolveAbandoned(abandonedEvents)
 	s.manager.notifyOfflineResolved(ctx, offlineEvents)
 	return err
 }
@@ -94,9 +100,11 @@ func (s *shard) processRetryTicks(ctx context.Context) error {
 		act.mu.Lock()
 		err := act.handleRetryEntry(ctx, entry)
 		events := act.drainExpiredEventsLocked()
+		abandonedEvents := act.drainResolveAbandonedEventsLocked()
 		offlineEvents := act.drainOfflineResolvedEventsLocked()
 		act.mu.Unlock()
 		s.manager.notifyRouteExpired(events)
+		s.manager.notifyResolveAbandoned(abandonedEvents)
 		s.manager.notifyOfflineResolved(ctx, offlineEvents)
 		if err != nil {
 			return err

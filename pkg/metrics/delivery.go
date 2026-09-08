@@ -17,18 +17,19 @@ type DeliverySnapshot struct {
 
 // DeliveryMetrics exposes route resolution, push RPC, actor, and expiry metrics.
 type DeliveryMetrics struct {
-	resolveDuration    *prometheus.HistogramVec
-	resolvePagesTotal  *prometheus.CounterVec
-	resolveRoutesTotal *prometheus.CounterVec
-	pushRPCTotal       *prometheus.CounterVec
-	pushRPCDuration    *prometheus.HistogramVec
-	pushRPCRoutesTotal *prometheus.CounterVec
-	actorInflight      prometheus.Gauge
-	ackBindings        prometheus.Gauge
-	routeExpiredTotal  *prometheus.CounterVec
-	mu                 sync.Mutex
-	actorInflightV     int64
-	ackBindingsV       int64
+	resolveDuration       *prometheus.HistogramVec
+	resolvePagesTotal     *prometheus.CounterVec
+	resolveRoutesTotal    *prometheus.CounterVec
+	pushRPCTotal          *prometheus.CounterVec
+	pushRPCDuration       *prometheus.HistogramVec
+	pushRPCRoutesTotal    *prometheus.CounterVec
+	actorInflight         prometheus.Gauge
+	ackBindings           prometheus.Gauge
+	routeExpiredTotal     *prometheus.CounterVec
+	resolveAbandonedTotal *prometheus.CounterVec
+	mu                    sync.Mutex
+	actorInflightV        int64
+	ackBindingsV          int64
 }
 
 func newDeliveryMetrics(registry prometheus.Registerer, labels prometheus.Labels) *DeliveryMetrics {
@@ -80,6 +81,11 @@ func newDeliveryMetrics(registry prometheus.Registerer, labels prometheus.Labels
 			Help:        "Total number of delivery routes expired before completion.",
 			ConstLabels: labels,
 		}, []string{"channel_type"}),
+		resolveAbandonedTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name:        "wukongim_delivery_resolve_abandoned_total",
+			Help:        "Total number of committed messages abandoned after exhausting delivery resolution retries.",
+			ConstLabels: labels,
+		}, []string{"channel_type"}),
 	}
 
 	registry.MustRegister(
@@ -92,6 +98,7 @@ func newDeliveryMetrics(registry prometheus.Registerer, labels prometheus.Labels
 		m.actorInflight,
 		m.ackBindings,
 		m.routeExpiredTotal,
+		m.resolveAbandonedTotal,
 	)
 
 	return m
@@ -145,6 +152,14 @@ func (m *DeliveryMetrics) ObserveRouteExpired(channelType string) {
 		return
 	}
 	m.routeExpiredTotal.WithLabelValues(channelType).Inc()
+}
+
+// ObserveResolveAbandoned records a committed message that exhausted delivery resolution retries.
+func (m *DeliveryMetrics) ObserveResolveAbandoned(channelType string) {
+	if m == nil {
+		return
+	}
+	m.resolveAbandonedTotal.WithLabelValues(channelType).Inc()
 }
 
 // Snapshot returns the latest delivery gauge values.
