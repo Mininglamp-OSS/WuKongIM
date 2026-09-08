@@ -361,6 +361,14 @@ func (s *observationSyncState) replaceRuntimeViewsLocked(next map[uint32]control
 	for slotID, view := range next {
 		current, ok := s.runtimeViews[slotID]
 		if ok && runtimeViewEquivalent(current, view) {
+			if !view.LastReportAt.After(current.LastReportAt) {
+				continue
+			}
+			s.revisions.Runtime++
+			current.LastReportAt = view.LastReportAt
+			s.runtimeViews[slotID] = current
+			s.runtimeRevisionBySlot[slotID] = s.revisions.Runtime
+			delete(s.deletedRuntimeRevisionBySlot, slotID)
 			continue
 		}
 		s.revisions.Runtime++
