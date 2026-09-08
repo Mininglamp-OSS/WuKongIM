@@ -1330,6 +1330,131 @@ func TestDeliveryRoutingUsesCachedTagWithoutListingSubscribers(t *testing.T) {
 	require.Zero(t, store.pageCalls)
 }
 
+func TestDeliveryRoutingReturnsCachedTagValidationErrorWithoutRebuilding(t *testing.T) {
+	topology := testDeliveryTagTopology(9)
+	manager := deliverytagruntime.NewManager(deliverytagruntime.Options{
+		LocalNodeID: 1,
+		NewTagKey:   func() string { return "tag-validation-error" },
+	})
+	_, created := manager.BuildLeaderTag(deliverytagruntime.BuildRequest{
+		ChannelKey:                      "2:g-validation-error",
+		SubscriberMutationVersion:       4,
+		SourceChannelKey:                "2:g-validation-error",
+		SourceSubscriberMutationVersion: 4,
+		Topology:                        topology,
+	})
+	require.True(t, created)
+
+	store := &resolverVersionStore{uids: []string{"u1"}, version: 4}
+	validationErr := errors.New("controller view unavailable")
+	topologyReader := &recordingDeliveryTagTopology{
+		version:     topology,
+		validateErr: validationErr,
+	}
+	resolver := tagDeliveryResolver{
+		localNodeID: 1,
+		tags:        manager,
+		subscribers: deliveryusecase.NewSubscriberResolver(deliveryusecase.SubscriberResolverOptions{Store: store}),
+		topology:    topologyReader,
+		pageSize:    8,
+	}
+
+	_, err := resolver.BeginResolve(context.Background(), deliveryruntime.ChannelKey{
+		ChannelID:   "g-validation-error",
+		ChannelType: frame.ChannelTypeGroup,
+	}, deliveryruntime.CommittedEnvelope{})
+
+	require.ErrorIs(t, err, validationErr)
+	require.Equal(t, 1, topologyReader.validateCalls)
+	require.Zero(t, topologyReader.currentCalls)
+	require.Zero(t, store.pageCalls)
+}
+
+func TestDeliveryRoutingRebuildsNewerSubscriberSnapshotBeforeCachedTagValidation(t *testing.T) {
+	cachedTopology := testDeliveryTagTopology(9)
+	currentTopology := testDeliveryTagTopology(10)
+	manager := deliverytagruntime.NewManager(deliverytagruntime.Options{
+		LocalNodeID: 1,
+		NewTagKey:   func() string { return "tag-stale-validation" },
+	})
+	_, created := manager.BuildLeaderTag(deliverytagruntime.BuildRequest{
+		ChannelKey:                      "2:g-stale-validation",
+		SubscriberMutationVersion:       4,
+		SourceChannelKey:                "2:g-stale-validation",
+		SourceSubscriberMutationVersion: 4,
+		Topology:                        cachedTopology,
+	})
+	require.True(t, created)
+
+	store := &resolverVersionStore{uids: []string{"u1"}, version: 5}
+	topologyReader := &recordingDeliveryTagTopology{
+		version:     currentTopology,
+		validateErr: errors.New("cached topology is temporarily unavailable"),
+	}
+	resolver := tagDeliveryResolver{
+		localNodeID: 1,
+		tags:        manager,
+		subscribers: deliveryusecase.NewSubscriberResolver(deliveryusecase.SubscriberResolverOptions{Store: store}),
+		topology:    topologyReader,
+		pageSize:    8,
+	}
+
+	_, err := resolver.BeginResolve(context.Background(), deliveryruntime.ChannelKey{
+		ChannelID:   "g-stale-validation",
+		ChannelType: frame.ChannelTypeGroup,
+	}, deliveryruntime.CommittedEnvelope{})
+
+	require.NoError(t, err)
+	require.Zero(t, topologyReader.validateCalls)
+	require.Equal(t, 1, topologyReader.currentCalls)
+	require.NotZero(t, store.pageCalls)
+	ref, ok := manager.CurrentRef("2:g-stale-validation")
+	require.True(t, ok)
+	require.Equal(t, uint64(5), ref.SubscriberMutationVersion)
+	require.Equal(t, currentTopology, ref.Topology)
+}
+
+func TestDeliveryRoutingRebuildsStaleSubscriberSnapshotAfterCachedTagValidationError(t *testing.T) {
+	cachedTopology := testDeliveryTagTopology(9)
+	currentTopology := testDeliveryTagTopology(10)
+	manager := deliverytagruntime.NewManager(deliverytagruntime.Options{
+		LocalNodeID: 1,
+		NewTagKey:   func() string { return "tag-stale-request-validation" },
+	})
+	_, created := manager.BuildLeaderTag(deliverytagruntime.BuildRequest{
+		ChannelKey:                      "2:g-stale-request-validation",
+		SubscriberMutationVersion:       5,
+		SourceChannelKey:                "2:g-stale-request-validation",
+		SourceSubscriberMutationVersion: 5,
+		Topology:                        cachedTopology,
+	})
+	require.True(t, created)
+
+	store := &resolverVersionStore{uids: []string{"u1"}, version: 4}
+	validationErr := errors.New("cached topology is temporarily unavailable")
+	topologyReader := &recordingDeliveryTagTopology{
+		version:     currentTopology,
+		validateErr: validationErr,
+	}
+	resolver := tagDeliveryResolver{
+		localNodeID: 1,
+		tags:        manager,
+		subscribers: deliveryusecase.NewSubscriberResolver(deliveryusecase.SubscriberResolverOptions{Store: store}),
+		topology:    topologyReader,
+		pageSize:    8,
+	}
+
+	_, err := resolver.BeginResolve(context.Background(), deliveryruntime.ChannelKey{
+		ChannelID:   "g-stale-request-validation",
+		ChannelType: frame.ChannelTypeGroup,
+	}, deliveryruntime.CommittedEnvelope{})
+
+	require.NoError(t, err)
+	require.Equal(t, 1, topologyReader.validateCalls)
+	require.Equal(t, 1, topologyReader.currentCalls)
+	require.NotZero(t, store.pageCalls)
+}
+
 func TestDeliveryRoutingSkipsCachedTagFastPathWithoutVersionFence(t *testing.T) {
 	topology := deliverytagruntime.PartitionTopologyVersion{
 		HashSlotTableVersion: 9,
@@ -1404,7 +1529,7 @@ func TestDeliveryTagTopologyReaderUsesCachedAssignmentsWithoutControllerRefresh(
 			{SlotID: 2, ConfigEpoch: 99, BalanceVersion: 99},
 		},
 	}
-	reader := deliveryTagTopologyReaderAdapter{cluster: cluster}
+	reader := newDeliveryTagTopologyReaderAdapter(cluster)
 
 	topology, err := reader.CurrentDeliveryTagTopology(context.Background(), []string{"u1", "u2", "u3"})
 
@@ -1417,6 +1542,506 @@ func TestDeliveryTagTopologyReaderUsesCachedAssignmentsWithoutControllerRefresh(
 			{SlotID: 2, LeaderNodeID: 12, ConfigEpoch: 22, BalanceVersion: 32},
 		},
 	}, topology)
+}
+
+func TestDeliveryTagTopologyReaderUsesCachedObservedLeaderForNonLocalSlot(t *testing.T) {
+	cluster := &recordingDeliveryTagCluster{
+		slotByKey: map[string]multiraft.SlotID{
+			"u1": 1,
+			"u2": 2,
+		},
+		leaderBySlot: map[multiraft.SlotID]multiraft.NodeID{
+			1: 11,
+		},
+		leaderErrBySlot: map[multiraft.SlotID]error{
+			2: multiraft.ErrSlotNotFound,
+		},
+		hashSlotTableVersion: 9,
+		cachedAssignments: []controllermeta.SlotAssignment{
+			{SlotID: 1, ConfigEpoch: 21, BalanceVersion: 31},
+			{SlotID: 2, ConfigEpoch: 22, BalanceVersion: 32},
+		},
+		cachedRuntimeViews: []controllermeta.SlotRuntimeView{
+			{SlotID: 2, LeaderID: 12, HasQuorum: true, ObservedConfigEpoch: 22},
+		},
+		cachedRuntimeViewsOK: true,
+	}
+	reader := newDeliveryTagTopologyReaderAdapter(cluster)
+
+	topology, err := reader.CurrentDeliveryTagTopology(context.Background(), []string{"u1", "u2"})
+
+	require.NoError(t, err)
+	require.Equal(t, deliverytagruntime.PartitionTopologyVersion{
+		HashSlotTableVersion: 9,
+		SlotAuthorityRefs: []deliverytagruntime.SlotAuthorityRef{
+			{SlotID: 1, LeaderNodeID: 11, ConfigEpoch: 21, BalanceVersion: 31},
+			{SlotID: 2, LeaderNodeID: 12, ConfigEpoch: 22, BalanceVersion: 32},
+		},
+	}, topology)
+	require.Zero(t, cluster.ListObservedRuntimeViewsStrictCalls())
+}
+
+func TestDeliveryTagTopologyReaderRejectsLeaderWithoutAssignment(t *testing.T) {
+	cluster := &recordingDeliveryTagCluster{
+		slotByKey: map[string]multiraft.SlotID{"u1": 2},
+		leaderErrBySlot: map[multiraft.SlotID]error{
+			2: multiraft.ErrSlotNotFound,
+		},
+		cachedRuntimeViews: []controllermeta.SlotRuntimeView{
+			{SlotID: 2, LeaderID: 12, HasQuorum: true, ObservedConfigEpoch: 22},
+		},
+		cachedRuntimeViewsOK: true,
+	}
+	reader := newDeliveryTagTopologyReaderAdapter(cluster)
+
+	_, err := reader.CurrentDeliveryTagTopology(context.Background(), []string{"u1"})
+
+	require.ErrorIs(t, err, errDeliveryTagSlotAssignmentMissing)
+	require.Zero(t, cluster.ListObservedRuntimeViewsStrictCalls())
+}
+
+func TestDeliveryTagTopologyReaderRefreshesObservedLeadersOnceForNonLocalSlots(t *testing.T) {
+	cluster := &recordingDeliveryTagCluster{
+		slotByKey: map[string]multiraft.SlotID{
+			"u1": 1,
+			"u2": 2,
+		},
+		leaderErrBySlot: map[multiraft.SlotID]error{
+			1: multiraft.ErrSlotNotFound,
+			2: multiraft.ErrSlotNotFound,
+		},
+		hashSlotTableVersion: 9,
+		cachedAssignments: []controllermeta.SlotAssignment{
+			{SlotID: 1, ConfigEpoch: 21, BalanceVersion: 31},
+			{SlotID: 2, ConfigEpoch: 22, BalanceVersion: 32},
+		},
+		strictRuntimeViews: []controllermeta.SlotRuntimeView{
+			{SlotID: 1, LeaderID: 11, HasQuorum: true, ObservedConfigEpoch: 21},
+			{SlotID: 2, LeaderID: 12, HasQuorum: true, ObservedConfigEpoch: 22},
+		},
+	}
+	reader := newDeliveryTagTopologyReaderAdapter(cluster)
+
+	topology, err := reader.CurrentDeliveryTagTopology(context.Background(), []string{"u1", "u2"})
+
+	require.NoError(t, err)
+	require.Equal(t, []deliverytagruntime.SlotAuthorityRef{
+		{SlotID: 1, LeaderNodeID: 11, ConfigEpoch: 21, BalanceVersion: 31},
+		{SlotID: 2, LeaderNodeID: 12, ConfigEpoch: 22, BalanceVersion: 32},
+	}, topology.SlotAuthorityRefs)
+	require.Equal(t, 1, cluster.ListObservedRuntimeViewsStrictCalls())
+}
+
+func TestDeliveryTagTopologyReaderBoundsStrictRuntimeViewRefresh(t *testing.T) {
+	cluster := &recordingDeliveryTagCluster{
+		slotByKey: map[string]multiraft.SlotID{"u1": 2},
+		leaderErrBySlot: map[multiraft.SlotID]error{
+			2: multiraft.ErrSlotNotFound,
+		},
+		cachedAssignments: []controllermeta.SlotAssignment{
+			{SlotID: 2, ConfigEpoch: 22},
+		},
+		strictRuntimeViews: []controllermeta.SlotRuntimeView{
+			{SlotID: 2, LeaderID: 12, HasQuorum: true, ObservedConfigEpoch: 22},
+		},
+	}
+	reader := newDeliveryTagTopologyReaderAdapter(cluster)
+
+	_, err := reader.CurrentDeliveryTagTopology(context.Background(), []string{"u1"})
+
+	require.NoError(t, err)
+	require.True(t, cluster.strictRuntimeViewsHasDeadline)
+	remaining := time.Until(cluster.strictRuntimeViewsDeadline)
+	require.Positive(t, remaining)
+	require.LessOrEqual(t, remaining, deliveryTagStrictRuntimeViewTimeout)
+}
+
+func TestDeliveryTagTopologyReaderCoalescesConcurrentStrictRefreshWaiters(t *testing.T) {
+	release := make(chan struct{})
+	cluster := &recordingDeliveryTagCluster{
+		slotByKey: map[string]multiraft.SlotID{"u1": 2},
+		leaderErrBySlot: map[multiraft.SlotID]error{
+			2: multiraft.ErrSlotNotFound,
+		},
+		cachedAssignments: []controllermeta.SlotAssignment{
+			{SlotID: 2, ConfigEpoch: 22},
+		},
+		strictRuntimeViews: []controllermeta.SlotRuntimeView{
+			{SlotID: 2, LeaderID: 12, HasQuorum: true, ObservedConfigEpoch: 22},
+		},
+		strictRuntimeViewsStarted: make(chan struct{}),
+		strictRuntimeViewsRelease: release,
+	}
+	reader := newDeliveryTagTopologyReaderAdapter(cluster)
+
+	returned := make(chan error, 6)
+	go func() {
+		_, err := reader.CurrentDeliveryTagTopology(context.Background(), []string{"u1"})
+		returned <- err
+	}()
+	select {
+	case <-cluster.strictRuntimeViewsStarted:
+	case <-time.After(time.Second):
+		require.FailNow(t, "strict controller refresh did not start")
+	}
+	for range 5 {
+		go func() {
+			_, err := reader.CurrentDeliveryTagTopology(context.Background(), []string{"u1"})
+			returned <- err
+		}()
+	}
+	require.Equal(t, 1, cluster.ListObservedRuntimeViewsStrictCalls())
+
+	close(release)
+	for range 6 {
+		select {
+		case err := <-returned:
+			require.NoError(t, err)
+		case <-time.After(time.Second):
+			require.FailNow(t, "topology lookup did not resume after the shared refresh")
+		}
+	}
+	require.Equal(t, 1, cluster.ListObservedRuntimeViewsStrictCalls())
+	require.True(t, cluster.strictRuntimeViewsHasDeadline)
+}
+
+func TestDeliveryTagTopologyReaderDetachesSharedRefreshFromOwnerCancellation(t *testing.T) {
+	release := make(chan struct{})
+	cluster := &recordingDeliveryTagCluster{
+		slotByKey: map[string]multiraft.SlotID{"u1": 2},
+		leaderErrBySlot: map[multiraft.SlotID]error{
+			2: multiraft.ErrSlotNotFound,
+		},
+		cachedAssignments: []controllermeta.SlotAssignment{
+			{SlotID: 2, ConfigEpoch: 22},
+		},
+		strictRuntimeViews: []controllermeta.SlotRuntimeView{
+			{SlotID: 2, LeaderID: 12, HasQuorum: true, ObservedConfigEpoch: 22},
+		},
+		strictRuntimeViewsStarted: make(chan struct{}),
+		strictRuntimeViewsRelease: release,
+	}
+	reader := newDeliveryTagTopologyReaderAdapter(cluster)
+	ownerCtx, cancelOwner := context.WithCancel(context.Background())
+	returned := make(chan error, 2)
+
+	go func() {
+		_, err := reader.CurrentDeliveryTagTopology(ownerCtx, []string{"u1"})
+		returned <- err
+	}()
+	select {
+	case <-cluster.strictRuntimeViewsStarted:
+	case <-time.After(time.Second):
+		require.FailNow(t, "strict controller refresh did not start")
+	}
+	cancelOwner()
+	go func() {
+		_, err := reader.CurrentDeliveryTagTopology(context.Background(), []string{"u1"})
+		returned <- err
+	}()
+
+	close(release)
+	for range 2 {
+		select {
+		case err := <-returned:
+			require.NoError(t, err)
+		case <-time.After(time.Second):
+			require.FailNow(t, "topology lookup did not resume after the shared refresh")
+		}
+	}
+	require.Equal(t, 1, cluster.ListObservedRuntimeViewsStrictCalls())
+}
+
+func TestDeliveryTagTopologyReaderBacksOffAfterStrictRefreshDeadline(t *testing.T) {
+	cluster := &recordingDeliveryTagCluster{
+		slotByKey: map[string]multiraft.SlotID{"u1": 2},
+		leaderErrBySlot: map[multiraft.SlotID]error{
+			2: multiraft.ErrSlotNotFound,
+		},
+		cachedAssignments: []controllermeta.SlotAssignment{
+			{SlotID: 2, ConfigEpoch: 22},
+		},
+		strictRuntimeViewsRelease: make(chan struct{}),
+	}
+	reader := newDeliveryTagTopologyReaderAdapter(cluster)
+
+	_, err := reader.CurrentDeliveryTagTopology(context.Background(), []string{"u1"})
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+
+	for range 5 {
+		_, err = reader.CurrentDeliveryTagTopology(context.Background(), []string{"u1"})
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+	}
+	require.Equal(t, 1, cluster.ListObservedRuntimeViewsStrictCalls())
+}
+
+func TestDeliveryTagTopologyReaderBacksOffAfterStrictRefreshFailure(t *testing.T) {
+	refreshErr := errors.New("controller unavailable")
+	cluster := &recordingDeliveryTagCluster{
+		slotByKey: map[string]multiraft.SlotID{"u1": 2},
+		leaderErrBySlot: map[multiraft.SlotID]error{
+			2: multiraft.ErrSlotNotFound,
+		},
+		cachedAssignments: []controllermeta.SlotAssignment{
+			{SlotID: 2, ConfigEpoch: 22},
+		},
+		strictRuntimeViewsErr: refreshErr,
+	}
+	reader := newDeliveryTagTopologyReaderAdapter(cluster)
+
+	_, err := reader.CurrentDeliveryTagTopology(context.Background(), []string{"u1"})
+	require.ErrorIs(t, err, refreshErr)
+
+	for range 5 {
+		_, err = reader.CurrentDeliveryTagTopology(context.Background(), []string{"u1"})
+		require.ErrorIs(t, err, refreshErr)
+	}
+	require.Equal(t, 1, cluster.ListObservedRuntimeViewsStrictCalls())
+}
+
+func TestDeliveryTagTopologyReaderStrictRefreshCacheCoversResolveRetryBudget(t *testing.T) {
+	cluster := &recordingDeliveryTagCluster{
+		slotByKey: map[string]multiraft.SlotID{"u1": 2},
+		leaderErrBySlot: map[multiraft.SlotID]error{
+			2: multiraft.ErrSlotNotFound,
+		},
+		cachedAssignments: []controllermeta.SlotAssignment{
+			{SlotID: 2, ConfigEpoch: 22},
+		},
+		strictRuntimeViews: []controllermeta.SlotRuntimeView{
+			{SlotID: 2, LeaderID: 12, HasQuorum: true, ObservedConfigEpoch: 22},
+		},
+	}
+	reader := newDeliveryTagTopologyReaderAdapter(cluster)
+	now := time.Unix(1, 0)
+	reader.runtimeViewRefreshes.now = func() time.Time { return now }
+
+	for _, elapsed := range []time.Duration{0, 550 * time.Millisecond, 1650 * time.Millisecond, 3850 * time.Millisecond} {
+		now = time.Unix(1, 0).Add(elapsed)
+		_, err := reader.CurrentDeliveryTagTopology(context.Background(), []string{"u1"})
+		require.NoError(t, err)
+	}
+	require.Equal(t, 1, cluster.ListObservedRuntimeViewsStrictCalls())
+}
+
+func TestDeliveryTagTopologyReaderRefreshesIncompleteStrictSnapshotAfterBackoff(t *testing.T) {
+	cluster := &recordingDeliveryTagCluster{
+		slotByKey: map[string]multiraft.SlotID{"u1": 2},
+		leaderErrBySlot: map[multiraft.SlotID]error{
+			2: multiraft.ErrSlotNotFound,
+		},
+		cachedAssignments: []controllermeta.SlotAssignment{
+			{SlotID: 2, ConfigEpoch: 22},
+		},
+	}
+	reader := newDeliveryTagTopologyReaderAdapter(cluster)
+	now := time.Unix(1, 0)
+	reader.runtimeViewRefreshes.now = func() time.Time { return now }
+
+	_, err := reader.CurrentDeliveryTagTopology(context.Background(), []string{"u1"})
+	require.ErrorIs(t, err, errDeliveryTagSlotLeaderUnavailable)
+	now = now.Add(deliveryTagStrictRuntimeViewFailureBackoff - time.Millisecond)
+	_, err = reader.CurrentDeliveryTagTopology(context.Background(), []string{"u1"})
+	require.ErrorIs(t, err, errDeliveryTagSlotLeaderUnavailable)
+	require.Equal(t, 1, cluster.ListObservedRuntimeViewsStrictCalls())
+
+	cluster.strictRuntimeViews = []controllermeta.SlotRuntimeView{
+		{SlotID: 2, LeaderID: 12, HasQuorum: true, ObservedConfigEpoch: 22},
+	}
+	now = now.Add(2 * time.Millisecond)
+	topology, err := reader.CurrentDeliveryTagTopology(context.Background(), []string{"u1"})
+	require.NoError(t, err)
+	require.Equal(t, uint64(12), topology.SlotAuthorityRefs[0].LeaderNodeID)
+	require.Equal(t, 2, cluster.ListObservedRuntimeViewsStrictCalls())
+}
+
+func TestDeliveryTagTopologyReaderRejectsNonLocalSlotWithoutStableObservedLeader(t *testing.T) {
+	cluster := &recordingDeliveryTagCluster{
+		slotByKey: map[string]multiraft.SlotID{"u1": 2},
+		leaderErrBySlot: map[multiraft.SlotID]error{
+			2: multiraft.ErrSlotNotFound,
+		},
+		cachedAssignments: []controllermeta.SlotAssignment{
+			{SlotID: 2, ConfigEpoch: 22, BalanceVersion: 32},
+		},
+		strictRuntimeViews: []controllermeta.SlotRuntimeView{
+			{SlotID: 2, LeaderID: 12, HasQuorum: false, ObservedConfigEpoch: 22},
+		},
+	}
+	reader := newDeliveryTagTopologyReaderAdapter(cluster)
+
+	_, err := reader.CurrentDeliveryTagTopology(context.Background(), []string{"u1"})
+
+	require.ErrorIs(t, err, errDeliveryTagSlotLeaderUnavailable)
+	require.Equal(t, 1, cluster.ListObservedRuntimeViewsStrictCalls())
+}
+
+func TestDeliveryTagTopologyReaderStrictRefreshSupersedesPartialCache(t *testing.T) {
+	cluster := &recordingDeliveryTagCluster{
+		slotByKey: map[string]multiraft.SlotID{
+			"u1": 1,
+			"u2": 2,
+		},
+		leaderErrBySlot: map[multiraft.SlotID]error{
+			1: multiraft.ErrSlotNotFound,
+			2: multiraft.ErrSlotNotFound,
+		},
+		cachedAssignments: []controllermeta.SlotAssignment{
+			{SlotID: 1, ConfigEpoch: 21},
+			{SlotID: 2, ConfigEpoch: 22},
+		},
+		cachedRuntimeViews: []controllermeta.SlotRuntimeView{
+			{SlotID: 1, LeaderID: 11, HasQuorum: true, ObservedConfigEpoch: 21},
+		},
+		cachedRuntimeViewsOK: true,
+		strictRuntimeViews: []controllermeta.SlotRuntimeView{
+			{SlotID: 1, LeaderID: 13, HasQuorum: true, ObservedConfigEpoch: 21},
+			{SlotID: 2, LeaderID: 12, HasQuorum: true, ObservedConfigEpoch: 22},
+		},
+	}
+	reader := newDeliveryTagTopologyReaderAdapter(cluster)
+
+	topology, err := reader.CurrentDeliveryTagTopology(context.Background(), []string{"u1", "u2"})
+
+	require.NoError(t, err)
+	require.Equal(t, []deliverytagruntime.SlotAuthorityRef{
+		{SlotID: 1, LeaderNodeID: 13, ConfigEpoch: 21},
+		{SlotID: 2, LeaderNodeID: 12, ConfigEpoch: 22},
+	}, topology.SlotAuthorityRefs)
+	require.Equal(t, 1, cluster.ListObservedRuntimeViewsStrictCalls())
+}
+
+func TestDeliveryTagTopologyReaderPreservesCachedLeaderOmittedFromStrictSnapshot(t *testing.T) {
+	cluster := &recordingDeliveryTagCluster{
+		slotByKey: map[string]multiraft.SlotID{
+			"u1": 1,
+			"u2": 2,
+		},
+		leaderErrBySlot: map[multiraft.SlotID]error{
+			1: multiraft.ErrSlotNotFound,
+			2: multiraft.ErrSlotNotFound,
+		},
+		cachedAssignments: []controllermeta.SlotAssignment{
+			{SlotID: 1, ConfigEpoch: 21},
+			{SlotID: 2, ConfigEpoch: 22},
+		},
+		cachedRuntimeViews: []controllermeta.SlotRuntimeView{
+			{SlotID: 1, LeaderID: 11, HasQuorum: true, ObservedConfigEpoch: 21},
+		},
+		cachedRuntimeViewsOK: true,
+		strictRuntimeViews: []controllermeta.SlotRuntimeView{
+			{SlotID: 2, LeaderID: 12, HasQuorum: true, ObservedConfigEpoch: 22},
+		},
+	}
+	reader := newDeliveryTagTopologyReaderAdapter(cluster)
+
+	topology, err := reader.CurrentDeliveryTagTopology(context.Background(), []string{"u1", "u2"})
+
+	require.NoError(t, err)
+	require.Equal(t, []deliverytagruntime.SlotAuthorityRef{
+		{SlotID: 1, LeaderNodeID: 11, ConfigEpoch: 21},
+		{SlotID: 2, LeaderNodeID: 12, ConfigEpoch: 22},
+	}, topology.SlotAuthorityRefs)
+}
+
+func TestDeliveryTagTopologyReaderPreservesCachedLeaderWhenStrictSnapshotHasNoQuorum(t *testing.T) {
+	cluster := &recordingDeliveryTagCluster{
+		slotByKey: map[string]multiraft.SlotID{
+			"u1": 1,
+			"u2": 2,
+		},
+		leaderErrBySlot: map[multiraft.SlotID]error{
+			1: multiraft.ErrSlotNotFound,
+			2: multiraft.ErrSlotNotFound,
+		},
+		cachedAssignments: []controllermeta.SlotAssignment{
+			{SlotID: 1, ConfigEpoch: 21},
+			{SlotID: 2, ConfigEpoch: 22},
+		},
+		cachedRuntimeViews: []controllermeta.SlotRuntimeView{
+			{SlotID: 1, LeaderID: 11, HasQuorum: true, ObservedConfigEpoch: 21},
+		},
+		cachedRuntimeViewsOK: true,
+		strictRuntimeViews: []controllermeta.SlotRuntimeView{
+			{SlotID: 1, HasQuorum: false, ObservedConfigEpoch: 21},
+			{SlotID: 2, LeaderID: 12, HasQuorum: true, ObservedConfigEpoch: 22},
+		},
+	}
+	reader := newDeliveryTagTopologyReaderAdapter(cluster)
+
+	topology, err := reader.CurrentDeliveryTagTopology(context.Background(), []string{"u1", "u2"})
+
+	require.NoError(t, err)
+	require.Equal(t, []deliverytagruntime.SlotAuthorityRef{
+		{SlotID: 1, LeaderNodeID: 11, ConfigEpoch: 21},
+		{SlotID: 2, LeaderNodeID: 12, ConfigEpoch: 22},
+	}, topology.SlotAuthorityRefs)
+	require.Equal(t, 1, cluster.ListObservedRuntimeViewsStrictCalls())
+}
+
+func TestDeliveryTagTopologyReaderDoesNotOverwriteAppliedLeaderFromCoordinatorCache(t *testing.T) {
+	cluster := &recordingDeliveryTagCluster{
+		slotByKey: map[string]multiraft.SlotID{
+			"u1": 1,
+			"u2": 2,
+		},
+		leaderErrBySlot: map[multiraft.SlotID]error{
+			1: multiraft.ErrSlotNotFound,
+			2: multiraft.ErrSlotNotFound,
+		},
+		cachedAssignments: []controllermeta.SlotAssignment{
+			{SlotID: 1, ConfigEpoch: 21},
+			{SlotID: 2, ConfigEpoch: 22},
+		},
+		strictRuntimeViews: []controllermeta.SlotRuntimeView{
+			{SlotID: 1, LeaderID: 11, HasQuorum: true, ObservedConfigEpoch: 21},
+			{SlotID: 2, LeaderID: 12, HasQuorum: true, ObservedConfigEpoch: 22},
+		},
+	}
+	reader := newDeliveryTagTopologyReaderAdapter(cluster)
+
+	_, err := reader.CurrentDeliveryTagTopology(context.Background(), []string{"u1", "u2"})
+	require.NoError(t, err)
+	require.Equal(t, 1, cluster.ListObservedRuntimeViewsStrictCalls())
+
+	cluster.cachedRuntimeViews = []controllermeta.SlotRuntimeView{
+		{SlotID: 1, LeaderID: 13, HasQuorum: true, ObservedConfigEpoch: 21},
+	}
+	cluster.cachedRuntimeViewsOK = true
+	topology, err := reader.CurrentDeliveryTagTopology(context.Background(), []string{"u1", "u2"})
+
+	require.NoError(t, err)
+	require.Equal(t, []deliverytagruntime.SlotAuthorityRef{
+		{SlotID: 1, LeaderNodeID: 13, ConfigEpoch: 21},
+		{SlotID: 2, LeaderNodeID: 12, ConfigEpoch: 22},
+	}, topology.SlotAuthorityRefs)
+	require.Equal(t, 1, cluster.ListObservedRuntimeViewsStrictCalls())
+}
+
+func TestDeliveryTagTopologyReaderRefreshesStaleObservedConfigEpoch(t *testing.T) {
+	cluster := &recordingDeliveryTagCluster{
+		slotByKey: map[string]multiraft.SlotID{"u1": 2},
+		leaderErrBySlot: map[multiraft.SlotID]error{
+			2: multiraft.ErrSlotNotFound,
+		},
+		cachedAssignments: []controllermeta.SlotAssignment{
+			{SlotID: 2, ConfigEpoch: 22},
+		},
+		cachedRuntimeViews: []controllermeta.SlotRuntimeView{
+			{SlotID: 2, LeaderID: 12, HasQuorum: true, ObservedConfigEpoch: 21},
+		},
+		cachedRuntimeViewsOK: true,
+		strictRuntimeViews: []controllermeta.SlotRuntimeView{
+			{SlotID: 2, LeaderID: 13, HasQuorum: true, ObservedConfigEpoch: 22},
+		},
+	}
+	reader := newDeliveryTagTopologyReaderAdapter(cluster)
+
+	topology, err := reader.CurrentDeliveryTagTopology(context.Background(), []string{"u1"})
+
+	require.NoError(t, err)
+	require.Equal(t, uint64(13), topology.SlotAuthorityRefs[0].LeaderNodeID)
+	require.Equal(t, 1, cluster.ListObservedRuntimeViewsStrictCalls())
 }
 
 func TestCurrentDeliveryTagAssignmentBySlotFiltersCachedAssignmentsToRequiredSlots(t *testing.T) {
@@ -1455,7 +2080,7 @@ func TestDeliveryTagTopologyValidatorUsesCachedAssignmentsWithoutControllerRefre
 			{SlotID: 2, ConfigEpoch: 99, BalanceVersion: 99},
 		},
 	}
-	reader := deliveryTagTopologyReaderAdapter{cluster: cluster}
+	reader := newDeliveryTagTopologyReaderAdapter(cluster)
 	topology := deliverytagruntime.PartitionTopologyVersion{
 		HashSlotTableVersion: 9,
 		SlotAuthorityRefs: []deliverytagruntime.SlotAuthorityRef{
@@ -1471,6 +2096,35 @@ func TestDeliveryTagTopologyValidatorUsesCachedAssignmentsWithoutControllerRefre
 	require.Zero(t, cluster.ListSlotAssignmentsCalls())
 }
 
+func TestDeliveryTagTopologyValidatorUsesObservedLeaderForNonLocalSlot(t *testing.T) {
+	cluster := &recordingDeliveryTagCluster{
+		leaderErrBySlot: map[multiraft.SlotID]error{
+			2: multiraft.ErrSlotNotFound,
+		},
+		hashSlotTableVersion: 9,
+		cachedAssignments: []controllermeta.SlotAssignment{
+			{SlotID: 2, ConfigEpoch: 22, BalanceVersion: 32},
+		},
+		cachedRuntimeViews: []controllermeta.SlotRuntimeView{
+			{SlotID: 2, LeaderID: 12, HasQuorum: true, ObservedConfigEpoch: 22},
+		},
+		cachedRuntimeViewsOK: true,
+	}
+	reader := newDeliveryTagTopologyReaderAdapter(cluster)
+	topology := deliverytagruntime.PartitionTopologyVersion{
+		HashSlotTableVersion: 9,
+		SlotAuthorityRefs: []deliverytagruntime.SlotAuthorityRef{
+			{SlotID: 2, LeaderNodeID: 12, ConfigEpoch: 22, BalanceVersion: 32},
+		},
+	}
+
+	valid, err := reader.ValidateCurrentDeliveryTagTopology(context.Background(), topology)
+
+	require.NoError(t, err)
+	require.True(t, valid)
+	require.Zero(t, cluster.ListObservedRuntimeViewsStrictCalls())
+}
+
 func TestDeliveryTagTopologyReaderFallsBackToListingAssignmentsWhenCacheMisses(t *testing.T) {
 	cluster := &recordingDeliveryTagCluster{
 		slotByKey: map[string]multiraft.SlotID{"u1": 1},
@@ -1482,7 +2136,7 @@ func TestDeliveryTagTopologyReaderFallsBackToListingAssignmentsWhenCacheMisses(t
 			{SlotID: 1, ConfigEpoch: 21, BalanceVersion: 31},
 		},
 	}
-	reader := deliveryTagTopologyReaderAdapter{cluster: cluster}
+	reader := newDeliveryTagTopologyReaderAdapter(cluster)
 
 	topology, err := reader.CurrentDeliveryTagTopology(context.Background(), []string{"u1"})
 
@@ -3062,13 +3716,43 @@ func (s staticDeliveryTagTopology) ValidateCurrentDeliveryTagTopology(_ context.
 	return s.version.Equal(topology), nil
 }
 
+type recordingDeliveryTagTopology struct {
+	version       deliverytagruntime.PartitionTopologyVersion
+	currentErr    error
+	validateErr   error
+	currentCalls  int
+	validateCalls int
+}
+
+func (r *recordingDeliveryTagTopology) CurrentDeliveryTagTopology(context.Context, []string) (deliverytagruntime.PartitionTopologyVersion, error) {
+	r.currentCalls++
+	return r.version.Clone(), r.currentErr
+}
+
+func (r *recordingDeliveryTagTopology) ValidateCurrentDeliveryTagTopology(_ context.Context, topology deliverytagruntime.PartitionTopologyVersion) (bool, error) {
+	r.validateCalls++
+	return r.version.Equal(topology), r.validateErr
+}
+
 type recordingDeliveryTagCluster struct {
-	slotByKey            map[string]multiraft.SlotID
-	leaderBySlot         map[multiraft.SlotID]multiraft.NodeID
-	hashSlotTableVersion uint64
-	cachedAssignments    []controllermeta.SlotAssignment
-	listAssignments      []controllermeta.SlotAssignment
-	listAssignmentsCalls int
+	strictMu                      sync.Mutex
+	slotByKey                     map[string]multiraft.SlotID
+	leaderBySlot                  map[multiraft.SlotID]multiraft.NodeID
+	leaderErrBySlot               map[multiraft.SlotID]error
+	hashSlotTableVersion          uint64
+	cachedAssignments             []controllermeta.SlotAssignment
+	listAssignments               []controllermeta.SlotAssignment
+	listAssignmentsCalls          int
+	cachedRuntimeViews            []controllermeta.SlotRuntimeView
+	cachedRuntimeViewsOK          bool
+	strictRuntimeViews            []controllermeta.SlotRuntimeView
+	strictRuntimeViewsErr         error
+	strictRuntimeViewsDeadline    time.Time
+	strictRuntimeViewsHasDeadline bool
+	strictRuntimeViewsStarted     chan struct{}
+	strictRuntimeViewsStartedOnce sync.Once
+	strictRuntimeViewsRelease     <-chan struct{}
+	listObservedRuntimeViewsCalls int
 }
 
 func (c *recordingDeliveryTagCluster) SlotForKey(key string) multiraft.SlotID {
@@ -3083,10 +3767,39 @@ func (c *recordingDeliveryTagCluster) HashSlotTableVersion() uint64 {
 }
 
 func (c *recordingDeliveryTagCluster) LeaderOf(slotID multiraft.SlotID) (multiraft.NodeID, error) {
+	if err := c.leaderErrBySlot[slotID]; err != nil {
+		return 0, err
+	}
 	if c.leaderBySlot == nil {
 		return multiraft.NodeID(slotID), nil
 	}
 	return c.leaderBySlot[slotID], nil
+}
+
+func (c *recordingDeliveryTagCluster) ListCachedObservedRuntimeViews() ([]controllermeta.SlotRuntimeView, bool) {
+	return append([]controllermeta.SlotRuntimeView(nil), c.cachedRuntimeViews...), c.cachedRuntimeViewsOK
+}
+
+func (c *recordingDeliveryTagCluster) ListObservedRuntimeViewsStrict(ctx context.Context) ([]controllermeta.SlotRuntimeView, error) {
+	c.strictMu.Lock()
+	c.listObservedRuntimeViewsCalls++
+	c.strictRuntimeViewsDeadline, c.strictRuntimeViewsHasDeadline = ctx.Deadline()
+	views := append([]controllermeta.SlotRuntimeView(nil), c.strictRuntimeViews...)
+	err := c.strictRuntimeViewsErr
+	started := c.strictRuntimeViewsStarted
+	release := c.strictRuntimeViewsRelease
+	c.strictMu.Unlock()
+	if started != nil {
+		c.strictRuntimeViewsStartedOnce.Do(func() { close(started) })
+	}
+	if release != nil {
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return views, err
 }
 
 func (c *recordingDeliveryTagCluster) ListSlotAssignments(context.Context) ([]controllermeta.SlotAssignment, error) {
@@ -3100,6 +3813,12 @@ func (c *recordingDeliveryTagCluster) ListCachedAssignments() []controllermeta.S
 
 func (c *recordingDeliveryTagCluster) ListSlotAssignmentsCalls() int {
 	return c.listAssignmentsCalls
+}
+
+func (c *recordingDeliveryTagCluster) ListObservedRuntimeViewsStrictCalls() int {
+	c.strictMu.Lock()
+	defer c.strictMu.Unlock()
+	return c.listObservedRuntimeViewsCalls
 }
 
 func testDeliveryTagTopology(version uint64) deliverytagruntime.PartitionTopologyVersion {
