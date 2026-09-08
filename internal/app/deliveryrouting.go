@@ -777,13 +777,26 @@ func (r deliveryTagTopologyReaderAdapter) CurrentDeliveryTagTopology(ctx context
 		slotIDs = append(slotIDs, slotID)
 	}
 	sort.Slice(slotIDs, func(i, j int) bool { return slotIDs[i] < slotIDs[j] })
-	assignmentBySlot := currentDeliveryTagAssignmentBySlot(ctx, r.cluster, slotIDs)
-	if !deliveryTagAssignmentMapCoversSlots(assignmentBySlot, slotIDs) {
-		return deliverytagruntime.PartitionTopologyVersion{}, deliveryTagMissingSlotAssignmentError(assignmentBySlot, slotIDs)
-	}
-	leaderBySlot, err := currentDeliveryTagLeaderBySlot(ctx, r.cluster, r.runtimeViewRefreshes, slotIDs, assignmentBySlot)
-	if err != nil {
-		return deliverytagruntime.PartitionTopologyVersion{}, err
+	assignmentBySlot, assignmentErr := currentDeliveryTagAssignmentBySlot(ctx, r.cluster, slotIDs)
+	var leaderBySlot map[uint32]uint64
+	if assignmentErr != nil {
+		// Preserve delivery during control-plane catch-up when every required slot
+		// is already hosted locally with a usable leader. Assignment epochs remain
+		// unknown instead of turning a controller read failure into a dropped message.
+		leaderBySlot = currentDeliveryTagLocalLeaderBySlot(r.cluster, slotIDs)
+		if err := deliveryTagMissingSlotLeaderError(leaderBySlot, slotIDs); err != nil {
+			return deliverytagruntime.PartitionTopologyVersion{}, assignmentErr
+		}
+		assignmentBySlot = nil
+	} else {
+		if !deliveryTagAssignmentMapCoversSlots(assignmentBySlot, slotIDs) {
+			return deliverytagruntime.PartitionTopologyVersion{}, deliveryTagMissingSlotAssignmentError(assignmentBySlot, slotIDs)
+		}
+		var err error
+		leaderBySlot, err = currentDeliveryTagLeaderBySlot(ctx, r.cluster, r.runtimeViewRefreshes, slotIDs, assignmentBySlot)
+		if err != nil {
+			return deliverytagruntime.PartitionTopologyVersion{}, err
+		}
 	}
 	refs := make([]deliverytagruntime.SlotAuthorityRef, 0, len(slotIDs))
 	for _, slotID := range slotIDs {
@@ -815,18 +828,34 @@ func (r deliveryTagTopologyReaderAdapter) ValidateCurrentDeliveryTagTopology(ctx
 	for _, ref := range topology.SlotAuthorityRefs {
 		slotIDs = append(slotIDs, ref.SlotID)
 	}
-	assignmentBySlot := currentDeliveryTagAssignmentBySlot(ctx, r.cluster, slotIDs)
-	if !deliveryTagAssignmentMapCoversSlots(assignmentBySlot, slotIDs) {
-		return false, nil
-	}
-	leaderBySlot, err := currentDeliveryTagLeaderBySlot(ctx, r.cluster, r.runtimeViewRefreshes, slotIDs, assignmentBySlot)
-	if err != nil {
-		return false, err
+	assignmentBySlot, assignmentErr := currentDeliveryTagAssignmentBySlot(ctx, r.cluster, slotIDs)
+	var leaderBySlot map[uint32]uint64
+	if assignmentErr != nil {
+		leaderBySlot = currentDeliveryTagLocalLeaderBySlot(r.cluster, slotIDs)
+		if err := deliveryTagMissingSlotLeaderError(leaderBySlot, slotIDs); err != nil {
+			return false, assignmentErr
+		}
+		assignmentBySlot = nil
+	} else {
+		if !deliveryTagAssignmentMapCoversSlots(assignmentBySlot, slotIDs) {
+			return false, nil
+		}
+		var err error
+		leaderBySlot, err = currentDeliveryTagLeaderBySlot(ctx, r.cluster, r.runtimeViewRefreshes, slotIDs, assignmentBySlot)
+		if err != nil {
+			return false, err
+		}
 	}
 	for _, ref := range topology.SlotAuthorityRefs {
 		assignment, ok := assignmentBySlot[ref.SlotID]
 		if !ok {
-			return false, nil
+			if ref.ConfigEpoch != 0 || ref.BalanceVersion != 0 {
+				return false, nil
+			}
+			if leaderBySlot[ref.SlotID] != ref.LeaderNodeID {
+				return false, nil
+			}
+			continue
 		}
 		if leaderBySlot[ref.SlotID] != ref.LeaderNodeID || assignment.ConfigEpoch != ref.ConfigEpoch || assignment.BalanceVersion != ref.BalanceVersion {
 			return false, nil
@@ -836,13 +865,7 @@ func (r deliveryTagTopologyReaderAdapter) ValidateCurrentDeliveryTagTopology(ctx
 }
 
 func currentDeliveryTagLeaderBySlot(ctx context.Context, cluster deliveryTagCluster, runtimeViewRefreshes *deliveryTagRuntimeViewRefreshCoordinator, requiredSlotIDs []uint32, assignmentBySlot map[uint32]controllermeta.SlotAssignment) (map[uint32]uint64, error) {
-	localLeaderBySlot := make(map[uint32]uint64, len(requiredSlotIDs))
-	for _, slotID := range requiredSlotIDs {
-		leaderID, err := cluster.LeaderOf(multiraft.SlotID(slotID))
-		if err == nil && leaderID != 0 {
-			localLeaderBySlot[slotID] = uint64(leaderID)
-		}
-	}
+	localLeaderBySlot := currentDeliveryTagLocalLeaderBySlot(cluster, requiredSlotIDs)
 	leaderBySlot := cloneDeliveryTagLeaderMap(localLeaderBySlot)
 	if deliveryTagLeaderMapCoversSlots(leaderBySlot, requiredSlotIDs) {
 		return leaderBySlot, nil
@@ -877,6 +900,20 @@ func currentDeliveryTagLeaderBySlot(ctx context.Context, cluster deliveryTagClus
 		return nil, err
 	}
 	return leaderBySlot, nil
+}
+
+func currentDeliveryTagLocalLeaderBySlot(cluster deliveryTagCluster, requiredSlotIDs []uint32) map[uint32]uint64 {
+	leaderBySlot := make(map[uint32]uint64, len(requiredSlotIDs))
+	if cluster == nil {
+		return leaderBySlot
+	}
+	for _, slotID := range requiredSlotIDs {
+		leaderID, err := cluster.LeaderOf(multiraft.SlotID(slotID))
+		if err == nil && leaderID != 0 {
+			leaderBySlot[slotID] = uint64(leaderID)
+		}
+	}
+	return leaderBySlot
 }
 
 func (c *deliveryTagRuntimeViewRefreshCoordinator) loadOrRefresh(ctx context.Context, cluster deliveryTagCluster) ([]controllermeta.SlotRuntimeView, bool, error) {
@@ -1047,18 +1084,22 @@ func deliveryTagLeaderMapCoversSlots(leaderBySlot map[uint32]uint64, requiredSlo
 	return true
 }
 
-func currentDeliveryTagAssignmentBySlot(ctx context.Context, cluster deliveryTagCluster, requiredSlotIDs []uint32) map[uint32]controllermeta.SlotAssignment {
+func currentDeliveryTagAssignmentBySlot(ctx context.Context, cluster deliveryTagCluster, requiredSlotIDs []uint32) (map[uint32]controllermeta.SlotAssignment, error) {
 	if len(requiredSlotIDs) == 0 || cluster == nil {
-		return nil
+		return nil, nil
 	}
+	var cachedAssignments map[uint32]controllermeta.SlotAssignment
 	if cached, ok := cluster.(cachedDeliveryTagAssignments); ok {
-		assignmentBySlot := deliveryTagAssignmentBySlot(cached.ListCachedAssignments(), requiredSlotIDs)
-		if deliveryTagAssignmentMapCoversSlots(assignmentBySlot, requiredSlotIDs) {
-			return assignmentBySlot
+		cachedAssignments = deliveryTagAssignmentBySlot(cached.ListCachedAssignments(), requiredSlotIDs)
+		if deliveryTagAssignmentMapCoversSlots(cachedAssignments, requiredSlotIDs) {
+			return cachedAssignments, nil
 		}
 	}
-	assignments, _ := cluster.ListSlotAssignments(ctx)
-	return deliveryTagAssignmentBySlot(assignments, requiredSlotIDs)
+	assignments, err := cluster.ListSlotAssignments(ctx)
+	if err != nil {
+		return cachedAssignments, err
+	}
+	return deliveryTagAssignmentBySlot(assignments, requiredSlotIDs), nil
 }
 
 func deliveryTagAssignmentBySlot(assignments []controllermeta.SlotAssignment, requiredSlotIDs []uint32) map[uint32]controllermeta.SlotAssignment {
