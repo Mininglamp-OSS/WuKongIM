@@ -853,13 +853,18 @@ func currentDeliveryTagLeaderBySlot(ctx context.Context, cluster deliveryTagClus
 	if runtimeViewRefreshes == nil {
 		return nil, errors.New("app: delivery tag runtime view refresh coordinator required")
 	}
-	views, err := runtimeViewRefreshes.loadOrRefresh(ctx, cluster)
+	views, refreshed, err := runtimeViewRefreshes.loadOrRefresh(ctx, cluster)
 	if err != nil {
 		return nil, err
 	}
-	// A strict refresh supersedes cached observations for slots it contains,
-	// while preserving local leaders and cached coverage for omitted slots.
-	mergeDeliveryTagStrictObservedLeaders(leaderBySlot, localLeaderBySlot, views, requiredSlotIDs, assignmentBySlot)
+	if refreshed {
+		// A fresh strict read supersedes cached observations only with a usable leader,
+		// while preserving local leaders and cached coverage for unresolved slots.
+		mergeDeliveryTagStrictObservedLeaders(leaderBySlot, localLeaderBySlot, views, requiredSlotIDs, assignmentBySlot)
+	} else {
+		// A coordinator cache hit may be older than this node's applied observation.
+		mergeDeliveryTagObservedLeaders(leaderBySlot, views, requiredSlotIDs, assignmentBySlot)
+	}
 	if err := deliveryTagMissingSlotLeaderError(leaderBySlot, requiredSlotIDs); err != nil {
 		runtimeViewRefreshes.markIncomplete()
 		return nil, err
@@ -867,9 +872,9 @@ func currentDeliveryTagLeaderBySlot(ctx context.Context, cluster deliveryTagClus
 	return leaderBySlot, nil
 }
 
-func (c *deliveryTagRuntimeViewRefreshCoordinator) loadOrRefresh(ctx context.Context, cluster deliveryTagCluster) ([]controllermeta.SlotRuntimeView, error) {
+func (c *deliveryTagRuntimeViewRefreshCoordinator) loadOrRefresh(ctx context.Context, cluster deliveryTagCluster) ([]controllermeta.SlotRuntimeView, bool, error) {
 	if c == nil {
-		return nil, errors.New("app: delivery tag runtime view refresh coordinator required")
+		return nil, false, errors.New("app: delivery tag runtime view refresh coordinator required")
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -881,7 +886,7 @@ func (c *deliveryTagRuntimeViewRefreshCoordinator) loadOrRefresh(ctx context.Con
 			views := cloneDeliveryTagRuntimeViews(c.views)
 			err := c.err
 			c.mu.Unlock()
-			return views, err
+			return views, false, err
 		}
 		if c.inFlight {
 			done := c.done
@@ -894,7 +899,7 @@ func (c *deliveryTagRuntimeViewRefreshCoordinator) loadOrRefresh(ctx context.Con
 			case <-waitCtx.Done():
 				err := waitCtx.Err()
 				cancel()
-				return nil, err
+				return nil, false, err
 			}
 		}
 		c.inFlight = true
@@ -902,7 +907,7 @@ func (c *deliveryTagRuntimeViewRefreshCoordinator) loadOrRefresh(ctx context.Con
 		done := c.done
 		c.mu.Unlock()
 
-		refreshCtx, cancel := context.WithTimeout(ctx, deliveryTagStrictRuntimeViewTimeout)
+		refreshCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), deliveryTagStrictRuntimeViewTimeout)
 		views, err := cluster.ListObservedRuntimeViewsStrict(refreshCtx)
 		cancel()
 
@@ -913,14 +918,22 @@ func (c *deliveryTagRuntimeViewRefreshCoordinator) loadOrRefresh(ctx context.Con
 		c.mu.Lock()
 		if err == nil {
 			c.views = cloneDeliveryTagRuntimeViews(views)
+			c.err = nil
+			c.expiresAt = c.nowTime().Add(ttl)
+		} else if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			c.views = nil
+			c.err = nil
+			c.expiresAt = time.Time{}
+		} else {
+			c.views = nil
+			c.err = err
+			c.expiresAt = c.nowTime().Add(ttl)
 		}
-		c.err = err
-		c.expiresAt = c.nowTime().Add(ttl)
 		c.inFlight = false
 		close(done)
 		c.done = nil
 		c.mu.Unlock()
-		return cloneDeliveryTagRuntimeViews(views), err
+		return cloneDeliveryTagRuntimeViews(views), true, err
 	}
 }
 
@@ -993,7 +1006,6 @@ func mergeDeliveryTagStrictObservedLeaders(leaderBySlot map[uint32]uint64, local
 		if _, required := requiredSlotSet[view.SlotID]; !required || localLeaderBySlot[view.SlotID] != 0 {
 			continue
 		}
-		delete(leaderBySlot, view.SlotID)
 		if view.LeaderID == 0 || !view.HasQuorum {
 			continue
 		}
@@ -1487,9 +1499,10 @@ func (r tagDeliveryResolver) leaderTagFromSnapshot(ctx context.Context, key deli
 				if validator, ok := r.topology.(deliveryTagTopologyValidator); ok {
 					valid, err := validator.ValidateCurrentDeliveryTagTopology(ctx, tag.Topology)
 					if err != nil {
-						return deliverytagruntime.DeliveryTag{}, err
-					}
-					if valid {
+						if hit {
+							return deliverytagruntime.DeliveryTag{}, err
+						}
+					} else if valid {
 						return tag, nil
 					}
 				}
