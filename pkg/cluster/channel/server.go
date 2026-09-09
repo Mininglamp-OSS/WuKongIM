@@ -1,6 +1,7 @@
 package channel
 
 import (
+	"context"
 	"sync"
 
 	"github.com/WuKongIM/WuKongIM/pkg/fasthash"
@@ -12,6 +13,12 @@ import (
 	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
 	"go.uber.org/zap"
 )
+
+// ReadLeaderState observes an existing channel without waking or creating it.
+func (s *Server) ReadLeaderState(ctx context.Context, channelID string, channelType uint8) (raftgroup.ReadState, error) {
+	key := wkutil.ChannelToKey(channelID, channelType)
+	return s.getRaftGroup(key).ReadLeaderState(ctx, key)
+}
 
 type Server struct {
 	raftGroups []*raftgroup.RaftGroup
