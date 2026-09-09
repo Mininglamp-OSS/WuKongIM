@@ -611,7 +611,7 @@ func build(cfg Config) (_ *App, err error) {
 			tags:               deliveryTagManager,
 			subscribers:        subscriberResolver,
 			authority:          deliveryAuthority,
-			topology:           deliveryTagTopologyReaderAdapter{cluster: app.cluster},
+			topology:           newDeliveryTagTopologyReaderAdapter(app.cluster),
 			uidObserver:        cmdUIDObserver,
 			collectOfflineUIDs: offlineResolvedObserver != nil,
 			metrics:            deliveryMetrics,

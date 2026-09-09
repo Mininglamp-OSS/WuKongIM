@@ -8,7 +8,7 @@ import (
 	controllermeta "github.com/WuKongIM/WuKongIM/pkg/controller/meta"
 )
 
-func TestObservationSyncStateBumpsRuntimeRevisionOnlyOnMeaningfulViewChange(t *testing.T) {
+func TestObservationSyncStateBumpsRuntimeRevisionOnFreshnessRenewalAndMeaningfulViewChange(t *testing.T) {
 	state := newObservationSyncState()
 
 	initial := []controllermeta.SlotRuntimeView{testObservationRuntimeView(1, 1, []uint64{1, 2, 3}, 1, time.Unix(10, 0))}
@@ -18,18 +18,60 @@ func TestObservationSyncStateBumpsRuntimeRevisionOnlyOnMeaningfulViewChange(t *t
 		t.Fatalf("currentRevisions().Runtime = %d, want %d", got, want)
 	}
 
+	beforeRenewal := state.currentRevisions()
 	sameMeaning := []controllermeta.SlotRuntimeView{testObservationRuntimeView(1, 1, []uint64{1, 2, 3}, 1, time.Unix(20, 0))}
 	state.replaceRuntimeViews(sameMeaning)
 
-	if got, want := state.currentRevisions().Runtime, uint64(1); got != want {
+	if got, want := state.currentRevisions().Runtime, uint64(2); got != want {
 		t.Fatalf("runtime revision after equivalent update = %d, want %d", got, want)
+	}
+	renewal := state.buildDelta(observationDeltaRequest{Revisions: beforeRenewal})
+	if got, want := len(renewal.RuntimeViews), 1; got != want {
+		t.Fatalf("len(renewal.RuntimeViews) = %d, want %d", got, want)
+	}
+	if got, want := renewal.RuntimeViews[0].LastReportAt, time.Unix(20, 0); !got.Equal(want) {
+		t.Fatalf("renewal.RuntimeViews[0].LastReportAt = %v, want %v", got, want)
+	}
+
+	state.replaceRuntimeViews([]controllermeta.SlotRuntimeView{testObservationRuntimeView(1, 1, []uint64{1, 2, 3}, 1, time.Unix(15, 0))})
+	if got, want := state.currentRevisions().Runtime, uint64(2); got != want {
+		t.Fatalf("runtime revision after older equivalent update = %d, want %d", got, want)
 	}
 
 	changed := []controllermeta.SlotRuntimeView{testObservationRuntimeView(1, 2, []uint64{1, 2, 3}, 1, time.Unix(30, 0))}
 	state.replaceRuntimeViews(changed)
 
-	if got, want := state.currentRevisions().Runtime, uint64(2); got != want {
+	if got, want := state.currentRevisions().Runtime, uint64(3); got != want {
 		t.Fatalf("runtime revision after meaningful change = %d, want %d", got, want)
+	}
+}
+
+func TestObservationSyncStatePropagatesRuntimeFreshnessToFollowerCache(t *testing.T) {
+	state := newObservationSyncState()
+	initialAt := time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC)
+	state.replaceRuntimeViews([]controllermeta.SlotRuntimeView{
+		testObservationRuntimeView(1, 1, []uint64{1, 2, 3}, 1, initialAt),
+	})
+
+	follower := observationAppliedState{}
+	applyObservationDelta(&follower, state.buildDelta(observationDeltaRequest{ForceFullSync: true}))
+	beforeRenewal := state.currentRevisions()
+	renewedAt := initialAt.Add(200 * time.Second)
+	state.replaceRuntimeViews([]controllermeta.SlotRuntimeView{
+		testObservationRuntimeView(1, 1, []uint64{1, 2, 3}, 1, renewedAt),
+	})
+
+	delta := state.buildDelta(observationDeltaRequest{Revisions: beforeRenewal})
+	if got, want := len(delta.RuntimeViews), 1; got != want {
+		t.Fatalf("len(delta.RuntimeViews) = %d, want %d", got, want)
+	}
+	applyObservationDelta(&follower, delta)
+	views := freshObservedRuntimeViews(sortedObservationRuntimeViews(follower.RuntimeViews), renewedAt, 180*time.Second)
+	if got, want := len(views), 1; got != want {
+		t.Fatalf("len(freshObservedRuntimeViews(...)) = %d, want %d", got, want)
+	}
+	if got := views[0].LastReportAt; !got.Equal(renewedAt) {
+		t.Fatalf("views[0].LastReportAt = %v, want %v", got, renewedAt)
 	}
 }
 

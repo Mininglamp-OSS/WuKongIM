@@ -1546,6 +1546,44 @@ func (c *Cluster) ListObservedRuntimeViews(ctx context.Context) ([]controllermet
 	return nil, ErrNotStarted
 }
 
+// ListCachedObservedRuntimeViews returns the latest controller-leader runtime
+// view already applied on this node without issuing a controller RPC.
+func (c *Cluster) ListCachedObservedRuntimeViews() ([]controllermeta.SlotRuntimeView, bool) {
+	if c == nil {
+		return nil, false
+	}
+	if c.controllerHost != nil && c.controllerHost.IsLeader(c.cfg.NodeID) {
+		if !c.controllerHost.warmupComplete() {
+			return nil, false
+		}
+		return c.controllerHost.snapshotObservations().RuntimeViews, true
+	}
+	if c.agent != nil {
+		views, ok := c.agent.appliedObservationRuntimeViews()
+		if !ok {
+			return nil, false
+		}
+		timeouts := c.cfg.Timeouts
+		timeouts.applyDefaults()
+		return freshObservedRuntimeViews(views, time.Now(), 3*timeouts.ObservationRuntimeFullSyncInterval), true
+	}
+	return nil, false
+}
+
+func freshObservedRuntimeViews(views []controllermeta.SlotRuntimeView, now time.Time, maxAge time.Duration) []controllermeta.SlotRuntimeView {
+	if len(views) == 0 || maxAge <= 0 {
+		return views
+	}
+	fresh := make([]controllermeta.SlotRuntimeView, 0, len(views))
+	for _, view := range views {
+		if view.LastReportAt.IsZero() || now.Sub(view.LastReportAt) > maxAge || view.LastReportAt.Sub(now) > time.Second {
+			continue
+		}
+		fresh = append(fresh, view)
+	}
+	return fresh
+}
+
 // ListObservedRuntimeViewsStrict returns the controller leader's observed runtime snapshot without local fallback.
 func (c *Cluster) ListObservedRuntimeViewsStrict(ctx context.Context) ([]controllermeta.SlotRuntimeView, error) {
 	if views, ok, err := c.localObservedRuntimeViewsStrict(); ok || err != nil {
