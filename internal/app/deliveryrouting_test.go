@@ -1600,6 +1600,52 @@ func TestDeliveryTagTopologyReaderRejectsLeaderWithoutAssignment(t *testing.T) {
 	require.Zero(t, cluster.ListObservedRuntimeViewsStrictCalls())
 }
 
+func TestDeliveryTagTopologyReaderRejectsLocalLeaderWithoutAuthoritativeAssignment(t *testing.T) {
+	cluster := &recordingDeliveryTagCluster{
+		slotByKey:            map[string]multiraft.SlotID{"u1": 1},
+		leaderBySlot:         map[multiraft.SlotID]multiraft.NodeID{1: 11},
+		hashSlotTableVersion: 9,
+	}
+	reader := newDeliveryTagTopologyReaderAdapter(cluster)
+
+	_, err := reader.CurrentDeliveryTagTopology(context.Background(), []string{"u1"})
+
+	require.ErrorIs(t, err, errDeliveryTagSlotAssignmentMissing)
+	require.Equal(t, 1, cluster.ListSlotAssignmentsCalls())
+	require.Zero(t, cluster.ListObservedRuntimeViewsStrictCalls())
+}
+
+func TestDeliveryTagTopologyReaderRecomputesSlotsWhenAssignmentRefreshUpdatesHashSlotTable(t *testing.T) {
+	cluster := &recordingDeliveryTagCluster{
+		slotByKey: map[string]multiraft.SlotID{"u1": 1},
+		leaderBySlot: map[multiraft.SlotID]multiraft.NodeID{
+			1: 11,
+			2: 12,
+		},
+		hashSlotTableVersion: 1,
+		listAssignments: []controllermeta.SlotAssignment{
+			{SlotID: 2, ConfigEpoch: 22, BalanceVersion: 32},
+		},
+	}
+	cluster.listAssignmentsHook = func(c *recordingDeliveryTagCluster) {
+		c.slotByKey["u1"] = 2
+		c.hashSlotTableVersion = 2
+		c.cachedAssignments = append([]controllermeta.SlotAssignment(nil), c.listAssignments...)
+	}
+	reader := newDeliveryTagTopologyReaderAdapter(cluster)
+
+	topology, err := reader.CurrentDeliveryTagTopology(context.Background(), []string{"u1"})
+
+	require.NoError(t, err)
+	require.Equal(t, deliverytagruntime.PartitionTopologyVersion{
+		HashSlotTableVersion: 2,
+		SlotAuthorityRefs: []deliverytagruntime.SlotAuthorityRef{
+			{SlotID: 2, LeaderNodeID: 12, ConfigEpoch: 22, BalanceVersion: 32},
+		},
+	}, topology)
+	require.Equal(t, 1, cluster.ListSlotAssignmentsCalls())
+}
+
 func TestDeliveryTagTopologyReaderUsesLocalLeadersWhenAssignmentRefreshFails(t *testing.T) {
 	assignmentErr := errors.New("controller unavailable")
 	cluster := &recordingDeliveryTagCluster{
@@ -2147,6 +2193,34 @@ func TestDeliveryTagTopologyValidatorUsesCachedAssignmentsWithoutControllerRefre
 	require.NoError(t, err)
 	require.True(t, valid)
 	require.Zero(t, cluster.ListSlotAssignmentsCalls())
+}
+
+func TestDeliveryTagTopologyValidatorInvalidatesWhenAssignmentRefreshUpdatesHashSlotTable(t *testing.T) {
+	cluster := &recordingDeliveryTagCluster{
+		leaderBySlot:         map[multiraft.SlotID]multiraft.NodeID{1: 11},
+		hashSlotTableVersion: 1,
+		listAssignments: []controllermeta.SlotAssignment{
+			{SlotID: 1, ConfigEpoch: 21, BalanceVersion: 31},
+		},
+	}
+	cluster.listAssignmentsHook = func(c *recordingDeliveryTagCluster) {
+		c.hashSlotTableVersion = 2
+		c.cachedAssignments = append([]controllermeta.SlotAssignment(nil), c.listAssignments...)
+	}
+	reader := newDeliveryTagTopologyReaderAdapter(cluster)
+	topology := deliverytagruntime.PartitionTopologyVersion{
+		HashSlotTableVersion: 1,
+		SlotAuthorityRefs: []deliverytagruntime.SlotAuthorityRef{
+			{SlotID: 1, LeaderNodeID: 11, ConfigEpoch: 21, BalanceVersion: 31},
+		},
+	}
+
+	valid, err := reader.ValidateCurrentDeliveryTagTopology(context.Background(), topology)
+
+	require.NoError(t, err)
+	require.False(t, valid)
+	require.Equal(t, 1, cluster.ListSlotAssignmentsCalls())
+	require.Zero(t, cluster.ListObservedRuntimeViewsStrictCalls())
 }
 
 func TestDeliveryTagTopologyValidatorUsesLocalLeadersWhenAssignmentRefreshFails(t *testing.T) {
@@ -3824,6 +3898,7 @@ type recordingDeliveryTagCluster struct {
 	listAssignments               []controllermeta.SlotAssignment
 	listAssignmentsErr            error
 	listAssignmentsCalls          int
+	listAssignmentsHook           func(*recordingDeliveryTagCluster)
 	cachedRuntimeViews            []controllermeta.SlotRuntimeView
 	cachedRuntimeViewsOK          bool
 	strictRuntimeViews            []controllermeta.SlotRuntimeView
@@ -3885,6 +3960,11 @@ func (c *recordingDeliveryTagCluster) ListObservedRuntimeViewsStrict(ctx context
 
 func (c *recordingDeliveryTagCluster) ListSlotAssignmentsStrict(context.Context) ([]controllermeta.SlotAssignment, error) {
 	c.listAssignmentsCalls++
+	if c.listAssignmentsHook != nil {
+		hook := c.listAssignmentsHook
+		c.listAssignmentsHook = nil
+		hook(c)
+	}
 	return append([]controllermeta.SlotAssignment(nil), c.listAssignments...), c.listAssignmentsErr
 }
 

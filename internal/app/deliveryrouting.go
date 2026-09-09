@@ -60,6 +60,9 @@ const (
 	deliveryTagStrictRuntimeViewCacheTTL = 5 * time.Second
 	// deliveryTagStrictRuntimeViewFailureBackoff prevents one controller failure per queued message.
 	deliveryTagStrictRuntimeViewFailureBackoff = 500 * time.Millisecond
+	// deliveryTagHashSlotTableResolveAttempts allows one in-call retry when an
+	// assignment refresh advances the hash-slot table used to derive slot IDs.
+	deliveryTagHashSlotTableResolveAttempts = 2
 
 	deliveryTagRPCStatusOK              = "ok"
 	deliveryTagRPCStatusRetryable       = "retryable"
@@ -768,6 +771,18 @@ func (r deliveryTagTopologyReaderAdapter) CurrentDeliveryTagTopology(ctx context
 	if r.cluster == nil {
 		return deliverytagruntime.PartitionTopologyVersion{}, nil
 	}
+	for attempt := 0; attempt < deliveryTagHashSlotTableResolveAttempts; attempt++ {
+		hashSlotTableVersion := r.cluster.HashSlotTableVersion()
+		topology, err := r.currentDeliveryTagTopology(ctx, uids, hashSlotTableVersion)
+		if r.cluster.HashSlotTableVersion() != hashSlotTableVersion {
+			continue
+		}
+		return topology, err
+	}
+	return deliverytagruntime.PartitionTopologyVersion{}, errors.New("app: delivery tag hash-slot table changed during topology resolution")
+}
+
+func (r deliveryTagTopologyReaderAdapter) currentDeliveryTagTopology(ctx context.Context, uids []string, hashSlotTableVersion uint64) (deliverytagruntime.PartitionTopologyVersion, error) {
 	slotSet := make(map[uint32]struct{})
 	for _, uid := range uids {
 		slotSet[uint32(r.cluster.SlotForKey(uid))] = struct{}{}
@@ -809,7 +824,7 @@ func (r deliveryTagTopologyReaderAdapter) CurrentDeliveryTagTopology(ctx context
 		})
 	}
 	return deliverytagruntime.PartitionTopologyVersion{
-		HashSlotTableVersion: r.cluster.HashSlotTableVersion(),
+		HashSlotTableVersion: hashSlotTableVersion,
 		SlotAuthorityRefs:    refs,
 	}, nil
 }
@@ -829,6 +844,9 @@ func (r deliveryTagTopologyReaderAdapter) ValidateCurrentDeliveryTagTopology(ctx
 		slotIDs = append(slotIDs, ref.SlotID)
 	}
 	assignmentBySlot, assignmentErr := currentDeliveryTagAssignmentBySlot(ctx, r.cluster, slotIDs)
+	if topology.HashSlotTableVersion != r.cluster.HashSlotTableVersion() {
+		return false, nil
+	}
 	var leaderBySlot map[uint32]uint64
 	if assignmentErr != nil {
 		leaderBySlot = currentDeliveryTagLocalLeaderBySlot(r.cluster, slotIDs)
@@ -860,6 +878,9 @@ func (r deliveryTagTopologyReaderAdapter) ValidateCurrentDeliveryTagTopology(ctx
 		if leaderBySlot[ref.SlotID] != ref.LeaderNodeID || assignment.ConfigEpoch != ref.ConfigEpoch || assignment.BalanceVersion != ref.BalanceVersion {
 			return false, nil
 		}
+	}
+	if topology.HashSlotTableVersion != r.cluster.HashSlotTableVersion() {
+		return false, nil
 	}
 	return true, nil
 }
