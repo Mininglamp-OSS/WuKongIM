@@ -985,18 +985,29 @@ func (c *Cluster) ProposeWithHashSlotResult(ctx context.Context, slotID multiraf
 		proposeErr = ErrNotStarted
 		return nil, proposeErr
 	}
+	// Bound discovery and rerouting even when the caller has a longer deadline.
+	// Keep the caller's existing deadline semantics for an in-flight proposal.
+	routeDeadline := start.Add(c.timeoutConfig().ForwardRetryBudget)
+	refreshLeader := false
 	retry := Retry{
 		Interval: c.forwardRetryInterval(),
 		MaxWait:  c.timeoutConfig().ForwardRetryBudget,
 		IsRetryable: func(err error) bool {
-			return errors.Is(err, ErrNotLeader)
+			return time.Now().Before(routeDeadline) && (errors.Is(err, ErrNotLeader) || errors.Is(err, ErrNoLeader))
 		},
 	}
 	var data []byte
-	proposeErr = retry.Do(ctx, func(attemptCtx context.Context) error {
+	proposeErr = retry.Do(ctx, func(attemptCtx context.Context) (attemptErr error) {
 		attempts++
+		defer func() {
+			if errors.Is(attemptErr, ErrNotLeader) {
+				refreshLeader = true
+			}
+		}()
 		payload := encodeProposalPayload(hashSlot, cmd)
-		leaderID, err := c.router.LeaderOf(slotID)
+		routeCtx, cancel := context.WithDeadline(attemptCtx, routeDeadline)
+		leaderID, err := c.resolveProposalLeader(routeCtx, slotID, refreshLeader)
+		cancel()
 		if err != nil {
 			return err
 		}
@@ -1005,6 +1016,9 @@ func (c *Cluster) ProposeWithHashSlotResult(ctx context.Context, slotID multiraf
 			if err != nil {
 				err = normalizeProposeError(err)
 				c.notifyProposeLocalErrorForTest(err)
+				if errors.Is(err, ErrSlotNotFound) {
+					return errors.Join(ErrNotLeader, err)
+				}
 				return err
 			}
 			result, err := future.Wait(attemptCtx)
@@ -1018,6 +1032,9 @@ func (c *Cluster) ProposeWithHashSlotResult(ctx context.Context, slotID multiraf
 		}
 		result, err := c.forwardToLeaderResult(attemptCtx, leaderID, slotID, payload)
 		if err != nil {
+			if errors.Is(err, ErrSlotNotFound) {
+				return errors.Join(ErrNotLeader, err)
+			}
 			return err
 		}
 		data = append(data[:0], result...)
@@ -1063,6 +1080,9 @@ func (c *Cluster) notifyProposeLocalErrorForTest(err error) {
 func normalizeProposeError(err error) error {
 	if errors.Is(err, multiraft.ErrNotLeader) {
 		return ErrNotLeader
+	}
+	if errors.Is(err, multiraft.ErrSlotNotFound) {
+		return ErrSlotNotFound
 	}
 	return err
 }
@@ -1325,7 +1345,9 @@ func (c *Cluster) updateRegisteredStateMachineFromHashSlotTable(slotID multiraft
 	}
 }
 
-// LeaderOf returns the current leader of the specified slot.
+// LeaderOf returns the leader observed by the local slot runtime, or
+// ErrSlotNotFound on a non-replica. Cluster-wide proposals resolve remote slots
+// separately; local-only guards must not use global routing hints.
 func (c *Cluster) LeaderOf(slotID multiraft.SlotID) (multiraft.NodeID, error) {
 	if c == nil || c.router == nil {
 		return 0, ErrNotStarted

@@ -137,6 +137,7 @@
 - Large Slot Raft snapshots are chunked only in `pkg/cluster` raft transport; receivers reassemble chunks into the original `MsgSnap` before calling `multiraft.Runtime.Step`.
 
 ### Local storage
+- Slot metadata proposals must route from non-replica ingress nodes using global assignments and observed/probed leaders. `Cluster.LeaderOf` and `ProposeLocalWithHashSlot` remain local-only; normalize missing-runtime errors to cluster `ErrSlotNotFound` so local leader scans can skip them.
 - `pkg/db` is the single local storage library: `message` owns channel logs and `meta` owns hash-slot metadata.
 - Ordinary new `pkg/db/meta` tables should use the meta table runtime registry; custom code is reserved for cache, guard, monotonic, or multi-record state-machine semantics.
 - A single-node deployment is still a single-node cluster; do not add storage or business paths that bypass cluster semantics.

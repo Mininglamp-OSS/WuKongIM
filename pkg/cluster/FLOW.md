@@ -158,7 +158,10 @@ Start():
 ProposeWithHashSlot:
   ③ encodeProposalPayload(hashSlot, cmd)  // 在 cmd 前附加 2 字节 hashSlot
   ④ Retry 循环 (ForwardRetryBudget 预算内):
-     a. router.LeaderOf(slotID) → 查询本地 Runtime 的 Leader
+     a. resolveProposalLeader(slotID):
+        → 优先本地 Runtime 的 leader 观测
+        → 本机无槽/无 leader 时，使用现有 observation cache 中当前 assignment 内、epoch/时间有效的 leader hint
+        → 无有效 hint 或上次提案被拒绝时，按全局 PeersForSlot 向副本发送 managed-slot status RPC，确认目标自身为 leader
      b. 本地 Leader:
         runtime.Propose(ctx, slotID, payload) → future.Wait(ctx)
      c. 远程 Leader:
@@ -168,7 +171,9 @@ ProposeWithHashSlot:
              decodeForwardPayload → runtime.Status(验证 Slot 存在)
              → runtime.Propose → future.Wait
              → encodeForwardResp(errCode, data)
-          → 解码响应: OK / NotLeader(重试) / Timeout / NoSlot
+          → 解码响应: OK / NotLeader / Timeout / NoSlot
+     d. NotLeader / 转发 NoSlot → 绕过旧 hint、重新探测；无 leader 可在剩余预算内重试
+        网络/提交 Timeout 不自动重放；Raft runtime 始终校验最终提案，观测不代替写入权限
   ⑤ 返回结果 (通过 ObserverHooks.OnForwardPropose 上报)
 ```
 
@@ -578,7 +583,8 @@ SlotIDs()/planner/readiness:
 ## 8. 避坑清单
 
 - **Propose 必须带 HashSlot**: `Propose()` 是兼容旧路径的快捷方式，仅适用于"一个物理 Slot 只有一个 Hash Slot"的场景。一旦 Slot 拥有多个 Hash Slot（AddSlot/Rebalance 后），必须使用 `ProposeWithHashSlot`，否则返回 `ErrHashSlotRequired`。
-- **Forward 重试预算有限**: `ProposeWithHashSlot` 内置 Retry 循环，`ForwardRetryBudget`(默认 300ms) 只重试 `ErrNotLeader`。网络分区或全部 peer 不可达时不会无限重试。
+- **全局写入与本地检查分离**: `ProposeWithHashSlot[Result]` 可以从非副本节点寻址并转发；`LeaderOf`、`ProposeLocalWithHashSlot` 仍只检查本机 runtime，非副本统一返回 cluster `ErrSlotNotFound`，以便本地 leader 扫描跳过无槽节点。
+- **Forward 重试预算有限**: `ForwardRetryBudget`（默认 300ms）限制 leader 探测和重路由，即使调用者 deadline 更长也不会无限重试；单 peer 只分得剩余探测预算的一部分。已发出的提案保留原有调用者 deadline 语义，网络/提交超时不自动重放。只将 `ErrNotLeader`、转发 `NoSlot`、探测无 leader 作为重路由信号，未知槽直接失败。
 - **Controller 观测读语义**: `ListObservedRuntimeViews` 在 leader 上优先读本地 `observationCache`；只有 leader 不可达时才允许降级到本地 `controllerMeta`，且结果可能滞后。
 - **Manager 严格一致读语义**: `ListNodesStrict`、`ListSlotAssignmentsStrict`、`ListObservedRuntimeViewsStrict`、`ListTasksStrict`、`GetReconcileTaskStrict` 只接受 controller leader 结果；本地节点若自身就是 leader 可直接读 leader 本地数据，否则必须经 controller client 读取，禁止降级到本地 `controllerMeta`。
 - **Manager Slot 日志读语义**: `SlotLogStatusOnNode` 只读取目标节点当前 Slot Raft 运行时的 commit/applied watermark；`SlotLogEntriesOnNode` 只读取目标节点本地 Slot storage 的 Raft log entry 摘要页（index/term/type/data_size），并对普通 Slot FSM command payload 生成脱敏 JSON inspection（如 command/uid/channel_id，token 固定为 `***`）。二者都用于运维排查，不能替代 controller leader strict-read 拓扑来源。

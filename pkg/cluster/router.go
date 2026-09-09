@@ -1,6 +1,7 @@
 package cluster
 
 import (
+	"errors"
 	"sync/atomic"
 
 	"github.com/WuKongIM/WuKongIM/pkg/slot/multiraft"
@@ -53,12 +54,17 @@ func (r *Router) HashSlotsOf(slotID multiraft.SlotID) []uint16 {
 	return table.HashSlotsOf(slotID)
 }
 
+// LeaderOf reads only the local runtime's leader observation. A non-replica
+// returns ErrSlotNotFound even when the slot exists elsewhere in the cluster.
 func (r *Router) LeaderOf(slotID multiraft.SlotID) (multiraft.NodeID, error) {
 	if r == nil || r.runtime == nil {
 		return 0, ErrNotStarted
 	}
 	status, err := r.runtime.Status(slotID)
 	if err != nil {
+		if errors.Is(err, multiraft.ErrSlotNotFound) {
+			return 0, ErrSlotNotFound
+		}
 		return 0, err
 	}
 	if status.LeaderID == 0 {

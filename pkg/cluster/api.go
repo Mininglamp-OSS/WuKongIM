@@ -20,6 +20,7 @@ type API interface {
 	HashSlotsOf(slotID multiraft.SlotID) []uint16
 	HashSlotTableVersion() uint64
 	ControllerLeaderID() uint64
+	// LeaderOf reads the local runtime; non-replicas return ErrSlotNotFound.
 	LeaderOf(slotID multiraft.SlotID) (multiraft.NodeID, error)
 	Propose(ctx context.Context, slotID multiraft.SlotID, cmd []byte) error
 
