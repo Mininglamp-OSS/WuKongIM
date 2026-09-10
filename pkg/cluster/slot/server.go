@@ -14,6 +14,10 @@ import (
 	"go.uber.org/zap"
 )
 
+func (s *Server) ReadLeaderState(ctx context.Context, slotID uint32) (raftgroup.ReadState, error) {
+	return s.raftGroup.ReadLeaderState(ctx, SlotIdToKey(slotID))
+}
+
 type Server struct {
 	raftGroup *raftgroup.RaftGroup
 	storage   *PebbleShardLogStorage

@@ -26,6 +26,8 @@ func newRpcServer(s *Server) *rpcServer {
 }
 
 func (r *rpcServer) setRoutes() {
+	r.s.netServer.Route(conversationConfigPath, func(c *wkserver.Context) { r.handleConversationRead(c, true) })
+	r.s.netServer.Route(conversationBoundaryPath, func(c *wkserver.Context) { r.handleConversationRead(c, false) })
 	// 频道提案
 	r.s.netServer.Route("/rpc/channel/propose", r.handleChannelPropose)
 

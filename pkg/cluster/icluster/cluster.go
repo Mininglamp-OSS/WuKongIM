@@ -63,6 +63,9 @@ type IClusterSlot interface {
 }
 
 type IClusterChannel interface {
+	// GetChannelLastMessageSeq reads a conversation boundary from the channel leader.
+	// It never creates a channel or falls back to a local follower.
+	GetChannelLastMessageSeq(ctx context.Context, channelID string, channelType uint8) (uint64, error)
 
 	// LeaderOfChannel 获取频道的领导节点 (如果频道分布式配置不存在则会创建新的分布式配置并提案)
 	LeaderOfChannel(channelId string, channelType uint8) (*types.Node, error)
