@@ -26,7 +26,7 @@ func boundaryReader(t *testing.T, cfg *wkdb.ChannelClusterConfig) conversationRe
 			return *cfg, ctx.Err()
 		},
 		state: func(context.Context, string, uint8) (raftgroup.ReadState, error) {
-			return raftgroup.ReadState{Exists: true, Ready: true, LeaderID: cfg.LeaderId, Term: cfg.Term, ConfigVersion: cfg.ConfVersion}, nil
+			return raftgroup.ReadState{Exists: true, Ready: true, LeaderID: cfg.LeaderId, Term: cfg.Term, ConfigVersion: cfg.ConfVersion, CommittedIndex: 42, AppliedIndex: 42}, nil
 		},
 		local: func(string, uint8) (uint64, uint64, error) {
 			t.Fatal("must not read the UID owner's local tail")
@@ -37,7 +37,7 @@ func boundaryReader(t *testing.T, cfg *wkdb.ChannelClusterConfig) conversationRe
 			require.Equal(t, conversationBoundaryPath, path)
 			require.Equal(t, *cfg, req.Expected)
 			seq, copy := uint64(42), *cfg
-			return conversationReadResponse{Version: 1, Sequence: &seq, Config: &copy}, ctx.Err()
+			return conversationReadResponse{Version: conversationReadVersion, Sequence: &seq, Config: &copy}, ctx.Err()
 		},
 	}
 }
@@ -239,4 +239,49 @@ func TestConversationReadServingState(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestConversationReadCommittedBoundary(t *testing.T) {
+	for _, tc := range []struct {
+		name                      string
+		tail, before, after, want uint64
+	}{
+		{"uncommitted suffix", 42, 41, 41, 41},
+		{"nothing committed", 42, 0, 0, 0},
+		{"commit during read", 42, 41, 42, 42},
+		{"tail below commit", 40, 41, 41, 40},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := boundaryConfig()
+			r := boundaryReader(t, &cfg)
+			r.nodeID = cfg.LeaderId
+			calls := 0
+			r.state = func(context.Context, string, uint8) (raftgroup.ReadState, error) {
+				calls++
+				committed := tc.before
+				if calls > 1 {
+					committed = tc.after
+				}
+				return raftgroup.ReadState{Exists: true, Ready: true, LeaderID: cfg.LeaderId, Term: cfg.Term, ConfigVersion: cfg.ConfVersion, CommittedIndex: committed}, nil
+			}
+			r.local = func(string, uint8) (uint64, uint64, error) { return tc.tail, 0, nil }
+			seq, err := r.readLocal(context.Background(), cfg)
+			require.NoError(t, err)
+			require.Equal(t, tc.want, seq)
+		})
+	}
+}
+
+func TestConversationReaderRetainsFailureCause(t *testing.T) {
+	cfg := boundaryConfig()
+	r := boundaryReader(t, &cfg)
+	r.remote = func(context.Context, uint64, string, conversationReadRequest) (conversationReadResponse, error) {
+		return conversationReadResponse{}, errors.New("connection reset")
+	}
+	_, err := r.latest(context.Background(), cfg.ChannelId, cfg.ChannelType)
+	require.ErrorIs(t, err, ErrConversationReadRetry)
+	require.ErrorContains(t, err, "connection reset")
+	require.ErrorContains(t, err, "channel leader 4")
+	require.ErrorContains(t, err, "attempt 2")
+	require.ErrorContains(t, err, cfg.ChannelId)
 }

@@ -113,7 +113,7 @@ func TestConversationReadRPC(t *testing.T) {
 		require.ErrorIs(t, err, ErrConversationReadRetry)
 		require.Zero(t, seq, "an unsupported metadata RPC is not an empty channel")
 	})
-	for _, body := range []string{"not supported", `{}`, `{"version":1}`, `{"version":1,"sequence":-1}`} {
+	for _, body := range []string{"not supported", `{}`, `{"version":1,"sequence":42,"config":{}}`, `{"version":2}`, `{"version":2,"sequence":-1}`} {
 		t.Run(body, func(t *testing.T) {
 			leader.netServer.Route(conversationBoundaryPath, func(c *wkserver.Context) {
 				if body == "not supported" {
@@ -165,10 +165,19 @@ func TestConversationReadSingleNode(t *testing.T) {
 	require.NoError(t, s.db.AppendMessages(cfg.ChannelId, cfg.ChannelType, []wkdb.Message{{Term: 1, RecvPacket: wkproto.RecvPacket{
 		ChannelID: cfg.ChannelId, ChannelType: cfg.ChannelType, MessageID: 42, MessageSeq: 42, Payload: []byte("message"),
 	}}}))
+	// Legacy recovery has no maintained durable commit marker. Pin that
+	// limitation explicitly: waking this pre-existing tail is not proof that
+	// its history reached quorum (see docs/conversation-boundary-reads.md).
+	persistedApplied, err := s.db.GetChannelAppliedIndex(cfg.ChannelId, cfg.ChannelType)
+	require.NoError(t, err)
+	require.Zero(t, persistedApplied)
 	for _, active := range []bool{false, true} {
 		t.Run(fmt.Sprintf("active=%t", active), func(t *testing.T) {
 			if active {
 				require.NoError(t, s.channelServer.WakeLeaderIfNeed(cfg))
+				state, err := s.channelServer.ReadLeaderState(ctx, cfg.ChannelId, cfg.ChannelType)
+				require.NoError(t, err)
+				require.Equal(t, uint64(42), state.CommittedIndex, "legacy recovery seeds committed from the stored tail")
 			}
 			seq, err := s.GetChannelLastMessageSeq(ctx, cfg.ChannelId, cfg.ChannelType)
 			require.NoError(t, err)
