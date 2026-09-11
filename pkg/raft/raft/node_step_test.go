@@ -229,15 +229,15 @@ func TestVoteReq_NoLogs_Rejected(t *testing.T) {
 	assert.Equal(t, types.ReasonError, e.Reason)
 }
 
-func TestVoteReq_Learner_BecomesFollower(t *testing.T) {
+func TestVoteReq_Learner_RemainsLearner(t *testing.T) {
 	n := newTestNode(1, []uint64{1, 2, 3})
 	makeLearner(n, 3, 2)
 	n.Step(types.Event{
 		Type: types.VoteReq, Term: 3, From: 2,
 		Logs: []types.Log{{Term: 3, Index: 0}},
 	})
-	// Learner should become follower
-	assert.Equal(t, types.RoleFollower, n.cfg.Role)
+	// A vote request is not a membership change.
+	assert.Equal(t, types.RoleLearner, n.cfg.Role)
 	assert.Equal(t, uint64(2), n.cfg.Leader)
 }
 
@@ -866,7 +866,7 @@ func TestRoleSwitchIfNeed_NoMigration_NoOp(t *testing.T) {
 	n.cfg.MigrateTo = 0
 	n.cfg.MigrateFrom = 0
 	n.replicaSync[2] = &SyncInfo{}
-	n.roleSwitchIfNeed(types.Event{From: 2, Index: 100})
+	n.roleSwitchIfNeed(types.Event{From: 2, Index: 100, StoredIndex: 100})
 	// No role switch events should be generated
 	events := collectEvents(n)
 	assert.Equal(t, 0, countEvents(events, types.LearnerToLeaderReq))
@@ -884,7 +884,7 @@ func TestRoleSwitchIfNeed_LearnerToLeader_CaughtUp(t *testing.T) {
 	n.queue.lastLogIndex = 10
 	n.replicaSync[4] = &SyncInfo{}
 	// Learner has caught up (Index >= lastLogIndex+1)
-	n.roleSwitchIfNeed(types.Event{From: 4, Index: 11})
+	n.roleSwitchIfNeed(types.Event{From: 4, Index: 11, StoredIndex: 11})
 	assert.True(t, n.replicaSync[4].roleSwitching)
 	events := collectEvents(n)
 	_, ok := findEvent(events, types.LearnerToLeaderReq)
@@ -902,7 +902,7 @@ func TestRoleSwitchIfNeed_LearnerToLeader_Approaching_StopPropose(t *testing.T) 
 	n.opts.LearnerToLeaderMinLogGap = 100
 	n.replicaSync[4] = &SyncInfo{}
 	// Learner is close but not caught up
-	n.roleSwitchIfNeed(types.Event{From: 4, Index: 150})
+	n.roleSwitchIfNeed(types.Event{From: 4, Index: 150, StoredIndex: 150})
 	assert.True(t, n.stopPropose)
 }
 
@@ -916,7 +916,7 @@ func TestRoleSwitchIfNeed_LearnerToFollower_CaughtUp(t *testing.T) {
 	n.opts.LearnerToFollowerMinLogGap = 100
 	n.replicaSync[4] = &SyncInfo{}
 	// Learner close enough (within gap)
-	n.roleSwitchIfNeed(types.Event{From: 4, Index: 5})
+	n.roleSwitchIfNeed(types.Event{From: 4, Index: 5, StoredIndex: 5})
 	// Index + gap = 105 > lastLogIndex=10 → should trigger
 	assert.True(t, n.replicaSync[4].roleSwitching)
 	events := collectEvents(n)
@@ -933,7 +933,7 @@ func TestRoleSwitchIfNeed_FollowerToLeader_CaughtUp(t *testing.T) {
 	n.queue.lastLogIndex = 10
 	n.replicaSync[2] = &SyncInfo{}
 	// Follower has caught up
-	n.roleSwitchIfNeed(types.Event{From: 2, Index: 11})
+	n.roleSwitchIfNeed(types.Event{From: 2, Index: 11, StoredIndex: 11})
 	assert.True(t, n.replicaSync[2].roleSwitching)
 	events := collectEvents(n)
 	_, ok := findEvent(events, types.FollowerToLeaderReq)
@@ -971,7 +971,7 @@ func TestRoleSwitchIfNeed_OrphanLearner_CaughtUp_Promotes(t *testing.T) {
 	n.opts.LearnerToFollowerMinLogGap = 100
 	n.replicaSync[4] = &SyncInfo{}
 	// Orphan learner is close enough: Index + gap = 105 > lastLogIndex=10
-	n.roleSwitchIfNeed(types.Event{From: 4, Index: 5})
+	n.roleSwitchIfNeed(types.Event{From: 4, Index: 5, StoredIndex: 5})
 	assert.True(t, n.replicaSync[4].roleSwitching, "orphan learner should be marked as switching")
 	events := collectEvents(n)
 	_, ok := findEvent(events, types.LearnerToFollowerReq)
@@ -991,7 +991,7 @@ func TestRoleSwitchIfNeed_OrphanLearner_NotCaughtUp_NoOp(t *testing.T) {
 	n.opts.LearnerToFollowerMinLogGap = 100
 	n.replicaSync[4] = &SyncInfo{}
 	// Orphan learner is far behind: Index + gap = 105 <= lastLogIndex=1000
-	n.roleSwitchIfNeed(types.Event{From: 4, Index: 5})
+	n.roleSwitchIfNeed(types.Event{From: 4, Index: 5, StoredIndex: 5})
 	assert.False(t, n.replicaSync[4].roleSwitching, "orphan learner should not switch when far behind")
 	events := collectEvents(n)
 	assert.Equal(t, 0, countEvents(events, types.LearnerToFollowerReq))
@@ -1009,7 +1009,7 @@ func TestRoleSwitchIfNeed_OrphanLearner_RoleSwitching_NoOp(t *testing.T) {
 	n.queue.lastLogIndex = 10
 	n.opts.LearnerToFollowerMinLogGap = 100
 	n.replicaSync[4] = &SyncInfo{roleSwitching: true}
-	n.roleSwitchIfNeed(types.Event{From: 4, Index: 5})
+	n.roleSwitchIfNeed(types.Event{From: 4, Index: 5, StoredIndex: 5})
 	events := collectEvents(n)
 	assert.Equal(t, 0, countEvents(events, types.LearnerToFollowerReq))
 }
@@ -1023,7 +1023,7 @@ func TestRoleSwitchIfNeed_NonLearner_NoMigration_NoOp(t *testing.T) {
 	n.cfg.MigrateTo = 0
 	n.cfg.MigrateFrom = 0
 	n.replicaSync[2] = &SyncInfo{}
-	n.roleSwitchIfNeed(types.Event{From: 2, Index: 100})
+	n.roleSwitchIfNeed(types.Event{From: 2, Index: 100, StoredIndex: 100})
 	events := collectEvents(n)
 	assert.Equal(t, 0, countEvents(events, types.LearnerToLeaderReq))
 	assert.Equal(t, 0, countEvents(events, types.LearnerToFollowerReq))

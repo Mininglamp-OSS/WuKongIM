@@ -66,10 +66,11 @@ func (n *Node) sendSyncReq() {
 
 func (n *Node) sendVoteReq(to uint64) {
 	n.events = append(n.events, types.Event{
-		Type: types.VoteReq,
-		From: n.opts.NodeId,
-		To:   to,
-		Term: n.cfg.Term,
+		Type:          types.VoteReq,
+		ConfigVersion: n.cfg.Version,
+		From:          n.opts.NodeId,
+		To:            to,
+		Term:          n.cfg.Term,
 		Logs: []types.Log{
 			{
 				Term:  n.lastTermStartIndex.Term,
@@ -81,12 +82,13 @@ func (n *Node) sendVoteReq(to uint64) {
 
 func (n *Node) sendVoteResp(to uint64, reason types.Reason) {
 	n.events = append(n.events, types.Event{
-		Type:   types.VoteResp,
-		From:   n.opts.NodeId,
-		To:     to,
-		Term:   n.cfg.Term,
-		Reason: reason,
-		Index:  n.queue.storedIndex,
+		Type:          types.VoteResp,
+		ConfigVersion: n.cfg.Version,
+		From:          n.opts.NodeId,
+		To:            to,
+		Term:          n.cfg.Term,
+		Reason:        reason,
+		Index:         n.queue.storedIndex,
 	})
 }
 
@@ -111,11 +113,13 @@ func (n *Node) sendPing(to uint64) {
 			continue
 		}
 		n.events = append(n.events, types.Event{
-			Type:  types.Ping,
-			From:  n.opts.NodeId,
-			To:    replicaId,
-			Term:  n.cfg.Term,
-			Index: n.queue.lastLogIndex,
+			Type:           types.Ping,
+			ConfigVersion:  n.cfg.Version,
+			CommittedIndex: n.queue.committedIndex,
+			From:           n.opts.NodeId,
+			To:             replicaId,
+			Term:           n.cfg.Term,
+			Index:          n.queue.lastLogIndex,
 		})
 	}
 	if len(n.cfg.Learners) > 0 {
@@ -124,11 +128,13 @@ func (n *Node) sendPing(to uint64) {
 				continue
 			}
 			n.events = append(n.events, types.Event{
-				Type:  types.Ping,
-				From:  n.opts.NodeId,
-				To:    replicaId,
-				Term:  n.cfg.Term,
-				Index: n.queue.lastLogIndex,
+				Type:           types.Ping,
+				ConfigVersion:  n.cfg.Version,
+				CommittedIndex: n.queue.committedIndex,
+				From:           n.opts.NodeId,
+				To:             replicaId,
+				Term:           n.cfg.Term,
+				Index:          n.queue.lastLogIndex,
 			})
 		}
 	}

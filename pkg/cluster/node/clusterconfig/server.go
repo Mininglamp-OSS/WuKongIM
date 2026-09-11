@@ -333,6 +333,7 @@ func (s *Server) configToRaftConfig(cfg *Config) rafttypes.Config {
 	}
 
 	return rafttypes.Config{
+		Version:     cfg.version(),
 		Replicas:    replicas,
 		MigrateFrom: cfg.cfg.MigrateFrom,
 		MigrateTo:   cfg.cfg.MigrateTo,

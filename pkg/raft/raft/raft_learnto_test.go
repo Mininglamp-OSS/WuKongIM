@@ -4,8 +4,8 @@ import (
 	"testing"
 
 	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
-	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
+	"github.com/WuKongIM/WuKongIM/pkg/wkutil"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -167,7 +167,7 @@ func TestRoleSwitchIfNeed_HalfClearedMigration_NoOrphanFire(t *testing.T) {
 			n.replicaSync[4] = &SyncInfo{}
 
 			// e.From=4 is a learner and caught up; orphan would have fired.
-			n.roleSwitchIfNeed(types.Event{From: 4, Index: 5})
+			n.roleSwitchIfNeed(types.Event{From: 4, Index: 5, StoredIndex: 5})
 
 			assert.False(t, n.replicaSync[4].roleSwitching, "half-cleared migration must not trigger orphan promotion")
 			events := collectEvents(n)
@@ -192,13 +192,13 @@ func TestRoleSwitchIfNeed_OrphanLearner_SingleReplica_StrictCatchUp(t *testing.T
 	n.replicaSync[4] = &SyncInfo{}
 
 	// Index=5, lastLogIndex=10 → gap path would fire, strict path must not.
-	n.roleSwitchIfNeed(types.Event{From: 4, Index: 5})
+	n.roleSwitchIfNeed(types.Event{From: 4, Index: 5, StoredIndex: 5})
 	assert.False(t, n.replicaSync[4].roleSwitching, "single-replica orphan must require strict catch-up")
 	events := collectEvents(n)
 	assert.Equal(t, 0, countEvents(events, types.LearnerToFollowerReq))
 
 	// strictly caught up → promotion fires.
-	n.roleSwitchIfNeed(types.Event{From: 4, Index: 11})
+	n.roleSwitchIfNeed(types.Event{From: 4, Index: 11, StoredIndex: 11})
 	assert.True(t, n.replicaSync[4].roleSwitching, "single-replica orphan should promote when fully caught up")
 	events = collectEvents(n)
 	_, ok := findEvent(events, types.LearnerToFollowerReq)

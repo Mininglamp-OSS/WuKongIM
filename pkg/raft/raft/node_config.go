@@ -25,6 +25,23 @@ func (n *Node) switchConfig(newCfg types.Config) error {
 		newCfg.Term = oldCfg.Term
 	}
 
+	if n.opts.ElectionOn && newCfg.Role == types.RoleUnknown && newCfg.Leader == None && isVoter(newCfg, oldCfg.Leader) {
+		newCfg.Leader = oldCfg.Leader
+	}
+	if !isVoter(newCfg, n.opts.NodeId) {
+		// A passive node may continue catching up, but never vote or campaign.
+		newCfg.Role = types.RoleLearner
+		if newCfg.Leader == n.opts.NodeId {
+			newCfg.Leader = None
+		}
+	} else if oldCfg.Role == types.RoleLearner || newCfg.Role == types.RoleLearner {
+		newCfg.Role = types.RoleFollower
+	}
+	if isVoter(newCfg, n.opts.NodeId) && oldCfg.Role == types.RoleCandidate && (!sameVoters(oldCfg, newCfg) || oldCfg.Version != newCfg.Version) {
+		newCfg.Role = types.RoleFollower
+		newCfg.Leader = None
+	}
+
 	n.votes = make(map[uint64]bool)
 	n.replicaSync = make(map[uint64]*SyncInfo)
 	n.resetRandomizedElectionTimeout()
@@ -32,6 +49,10 @@ func (n *Node) switchConfig(newCfg types.Config) error {
 	// 比较角色是否发生变化
 	n.roleChangeIfNeed(oldCfg, newCfg)
 
+	// Preserve the locally selected role. An unspecified role in a membership
+	// update must not erase the role just established by roleChangeIfNeed.
+	newCfg.Role = n.cfg.Role
+	newCfg.Leader = n.cfg.Leader
 	n.cfg = newCfg
 
 	return nil

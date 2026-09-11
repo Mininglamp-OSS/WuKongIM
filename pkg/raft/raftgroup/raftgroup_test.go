@@ -144,8 +144,8 @@ func BenchmarkPropose(b *testing.B) {
 	defer rg1.Stop()
 	defer rg2.Stop()
 
-	node1 := newTestRaftNode("ch001", 1, 0, types.RaftState{}, raft.WithElectionInterval(5), raft.WithElectionOn(true), raft.WithReplicas([]uint64{2}))
-	node2 := newTestRaftNode("ch001", 2, 0, types.RaftState{}, raft.WithElectionInterval(5), raft.WithElectionOn(true), raft.WithReplicas([]uint64{1}))
+	node1 := newTestRaftNode("ch001", 1, 0, types.RaftState{}, raft.WithElectionInterval(5), raft.WithElectionOn(true), raft.WithReplicas([]uint64{1, 2}))
+	node2 := newTestRaftNode("ch001", 2, 0, types.RaftState{}, raft.WithElectionInterval(5), raft.WithElectionOn(true), raft.WithReplicas([]uint64{1, 2}))
 	rg1.AddRaft(node1)
 	rg2.AddRaft(node2)
 
@@ -203,8 +203,8 @@ func TestProposeBatch(t *testing.T) {
 	defer rg1.Stop()
 	defer rg2.Stop()
 
-	node1 := newTestRaftNode("ch001", 1, 0, types.RaftState{}, raft.WithElectionInterval(5), raft.WithElectionOn(true), raft.WithReplicas([]uint64{2}))
-	node2 := newTestRaftNode("ch001", 2, 0, types.RaftState{}, raft.WithElectionInterval(5), raft.WithElectionOn(true), raft.WithReplicas([]uint64{1}))
+	node1 := newTestRaftNode("ch001", 1, 0, types.RaftState{}, raft.WithElectionInterval(5), raft.WithElectionOn(true), raft.WithReplicas([]uint64{1, 2}))
+	node2 := newTestRaftNode("ch001", 2, 0, types.RaftState{}, raft.WithElectionInterval(5), raft.WithElectionOn(true), raft.WithReplicas([]uint64{1, 2}))
 	rg1.AddRaft(node1)
 	rg2.AddRaft(node2)
 
@@ -260,8 +260,8 @@ func TestApply(t *testing.T) {
 	defer rg1.Stop()
 	defer rg2.Stop()
 
-	node1 := newTestRaftNode("ch001", 1, 0, types.RaftState{}, raft.WithElectionInterval(5), raft.WithElectionOn(true), raft.WithReplicas([]uint64{2}))
-	node2 := newTestRaftNode("ch001", 2, 0, types.RaftState{}, raft.WithElectionInterval(5), raft.WithElectionOn(true), raft.WithReplicas([]uint64{1}))
+	node1 := newTestRaftNode("ch001", 1, 0, types.RaftState{}, raft.WithElectionInterval(5), raft.WithElectionOn(true), raft.WithReplicas([]uint64{1, 2}))
+	node2 := newTestRaftNode("ch001", 2, 0, types.RaftState{}, raft.WithElectionInterval(5), raft.WithElectionOn(true), raft.WithReplicas([]uint64{1, 2}))
 	rg1.AddRaft(node1)
 	rg2.AddRaft(node2)
 

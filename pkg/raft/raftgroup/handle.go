@@ -342,6 +342,9 @@ func (rg *RaftGroup) handleRoleChangeReq(r IRaft, e types.Event) {
 
 // 学习者转换
 func (rg *RaftGroup) learnTo(r IRaft, learnerId uint64) (types.Config, error) {
+	if !wkutil.ArrayContainsUint64(r.Config().Learners, learnerId) {
+		return types.Config{}, errors.New("promotion target is not a learner")
+	}
 	cfg := r.Config().Clone()
 
 	// orphan learner: 前次迁移已完成（MigrateFrom/MigrateTo 都为 0），
