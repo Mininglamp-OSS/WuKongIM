@@ -3,6 +3,8 @@ package raft
 import "github.com/WuKongIM/WuKongIM/pkg/raft/types"
 
 type Storage interface {
+	// SaveHardState must durably save term and vote together before returning.
+	SaveHardState(types.HardState) error
 	// AppendLogs 追加日志, 如果termStartIndex不为nil, 则需要保存termStartIndex，最好确保原子性
 	AppendLogs(logs []types.Log, termStartIndex *types.TermStartIndexInfo) error
 	// GetLogs 获取日志 startLogIndex日志开始下标,endLogIndex结束日志下标 limitSize限制每次查询日志大小，0表示不限制，结果包含startLogIndex不包含 endLogIndex

@@ -1,6 +1,10 @@
 package wkdb
 
+import "github.com/WuKongIM/WuKongIM/pkg/raft/types"
+
 type DB interface {
+	SaveRaftHardState(shardNo string, state types.HardState) error
+	RaftHardState(shardNo string) (types.HardState, error)
 	Open() error
 	Close() error
 	// 获取下一个主键

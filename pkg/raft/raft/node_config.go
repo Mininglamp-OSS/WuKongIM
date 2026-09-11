@@ -30,6 +30,7 @@ func (n *Node) switchConfig(newCfg types.Config) error {
 	n.resetRandomizedElectionTimeout()
 
 	// 比较角色是否发生变化
+	n.setTerm(newCfg.Term)
 	n.roleChangeIfNeed(oldCfg, newCfg)
 
 	n.cfg = newCfg

@@ -42,13 +42,13 @@ func (n *Node) Step(e types.Event) error {
 	case types.VoteReq: // 投票请求
 		if n.cfg.Role != types.RoleLearner {
 			if n.canVote(e) {
+				n.voteFor = e.From
 				if e.From == n.opts.NodeId {
 					n.sendVoteResp(types.LocalNode, types.ReasonOk)
 				} else {
 					n.sendVoteResp(e.From, types.ReasonOk)
 				}
 
-				n.voteFor = e.From
 				n.electionElapsed = 0
 				if e.From != n.opts.NodeId {
 					n.Info("agree vote", zap.Uint64("voteFor", e.From), zap.Uint32("term", e.Term), zap.Uint64("index", e.Index))

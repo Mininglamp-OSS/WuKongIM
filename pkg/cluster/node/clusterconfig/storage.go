@@ -174,7 +174,13 @@ func (p *PebbleShardLogStorage) GetState() (types.RaftState, error) {
 		return types.RaftState{}, err
 	}
 
+	state, err := p.hardState()
+	if err != nil {
+		return types.RaftState{}, err
+	}
+
 	return types.RaftState{
+		HardState:    state,
 		LastLogIndex: lastIndex,
 		LastTerm:     lastTerm,
 		AppliedIndex: applied,
@@ -475,4 +481,22 @@ func (p *PebbleShardLogStorage) saveMaxIndexWithWriter(index uint64, w pebble.Wr
 
 	err := w.Set(maxIndexKeyData, append(maxIndexdata, lastTimeData...), o)
 	return err
+}
+
+func (p *PebbleShardLogStorage) SaveHardState(state types.HardState) error {
+	return p.db.Set(key.NewHardStateKey(), state.Marshal(), pebble.Sync)
+}
+
+func (p *PebbleShardLogStorage) hardState() (types.HardState, error) {
+	var state types.HardState
+	data, closer, err := p.db.Get(key.NewHardStateKey())
+	if errors.Is(err, pebble.ErrNotFound) {
+		return state, nil
+	}
+	if err != nil {
+		return state, err
+	}
+	defer closer.Close()
+	err = state.Unmarshal(data)
+	return state, err
 }

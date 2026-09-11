@@ -35,6 +35,7 @@ type Raft struct {
 }
 
 func New(opts *Options) *Raft {
+	opts.SaveHardState = opts.Storage.SaveHardState
 
 	raftState, err := opts.Storage.GetState()
 	if err != nil {

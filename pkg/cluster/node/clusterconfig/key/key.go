@@ -59,3 +59,5 @@ func NewAppliedIndexKey() []byte {
 	key[3] = 0
 	return key
 }
+
+func NewHardStateKey() []byte { return []byte{0x5, 0x5, 0, 0} }
