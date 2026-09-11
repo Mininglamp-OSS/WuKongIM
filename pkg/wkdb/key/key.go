@@ -1165,3 +1165,8 @@ func NewMessageEventSeqKey(channelId string, channelType uint8, clientMsgNo stri
 	binary.BigEndian.PutUint64(key[12:], HashWithString(clientMsgNo))
 	return key
 }
+
+// NewRaftHardStateKey uses a dedicated table and the full shard identity.
+func NewRaftHardStateKey(shardNo string) []byte {
+	return append([]byte{0x1B, 0x01, dataTypeOther, 0}, []byte(shardNo)...)
+}

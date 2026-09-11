@@ -3,6 +3,7 @@ package slot
 import (
 	"github.com/WuKongIM/WuKongIM/pkg/cluster/node/types"
 	"github.com/WuKongIM/WuKongIM/pkg/raft/raft"
+	rafttypes "github.com/WuKongIM/WuKongIM/pkg/raft/types"
 	"github.com/WuKongIM/WuKongIM/pkg/wklog"
 	"go.uber.org/zap"
 )
@@ -29,7 +30,7 @@ func newSlot(slot *types.Slot, s *Server) *Slot {
 	if err != nil {
 		st.Panic("get last term failed", zap.Error(err))
 	}
-	node := raft.NewNode(lastLogIndex, state, raft.NewOptions(raft.WithKey(shardNo), raft.WithNodeId(s.opts.NodeId)))
+	node := raft.NewNode(lastLogIndex, state, raft.NewOptions(raft.WithKey(shardNo), raft.WithNodeId(s.opts.NodeId), raft.WithSaveHardState(func(state rafttypes.HardState) error { return s.storage.SaveHardState(shardNo, state) })))
 	st.Node = node
 
 	return st

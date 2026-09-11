@@ -51,7 +51,7 @@ func TestBecomeLearner_SetsState(t *testing.T) {
 	assert.NotNil(t, n.tickFnc)
 }
 
-func TestReset_ClearsState(t *testing.T) {
+func TestReset_ClearsVolatileState(t *testing.T) {
 	n := newTestNode(1, []uint64{1, 2, 3})
 	n.voteFor = 2
 	n.votes[2] = true
@@ -60,7 +60,7 @@ func TestReset_ClearsState(t *testing.T) {
 	n.suspend = true
 	n.replicaSync[2] = &SyncInfo{StoredIndex: 10}
 	n.reset()
-	assert.Equal(t, uint64(0), n.voteFor)
+	assert.Equal(t, uint64(2), n.voteFor)
 	assert.Equal(t, 0, len(n.votes))
 	assert.False(t, n.stopPropose)
 	assert.False(t, n.onlySync)

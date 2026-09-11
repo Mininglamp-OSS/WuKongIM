@@ -2,6 +2,8 @@ package raft
 
 import (
 	"time"
+
+	"github.com/WuKongIM/WuKongIM/pkg/raft/types"
 )
 
 type Options struct {
@@ -29,6 +31,9 @@ type Options struct {
 	Transport Transport
 	//	 Storage 存储层
 	Storage Storage
+	// SaveHardState synchronously persists term/vote. Required for durable Node embedders.
+	// Raft.New supplies this from Storage; nil is for in-memory state-machine users.
+	SaveHardState func(types.HardState) error
 	// Advance 用于推进状态机
 	Advance func()
 	// MaxLogCountPerBatch 每次同步的最大日志数量
@@ -215,4 +220,8 @@ func WithAutoDestory(autoDestory bool) Option {
 	return func(opts *Options) {
 		opts.AutoDestory = autoDestory
 	}
+}
+
+func WithSaveHardState(save func(types.HardState) error) Option {
+	return func(opts *Options) { opts.SaveHardState = save }
 }

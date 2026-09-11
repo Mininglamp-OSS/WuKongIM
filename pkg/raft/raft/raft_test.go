@@ -353,6 +353,7 @@ func (t *testTransport) Send(event types.Event) {
 }
 
 type testStorage struct {
+	hardState       types.HardState
 	nodeId          uint64
 	logs            []types.Log
 	termStartIndexs []*types.TermStartIndexInfo
@@ -382,10 +383,11 @@ func (s *testStorage) GetLogs(start, end uint64, limitSize uint64) ([]types.Log,
 
 func (s *testStorage) GetState() (types.RaftState, error) {
 	if len(s.logs) == 0 {
-		return types.RaftState{}, nil
+		return types.RaftState{HardState: s.hardState}, nil
 	}
 	lastLog := s.logs[len(s.logs)-1]
 	return types.RaftState{
+		HardState:    s.hardState,
 		LastLogIndex: lastLog.Index,
 		LastTerm:     lastLog.Term,
 		AppliedIndex: lastLog.Index,
@@ -533,3 +535,5 @@ func raftStop(rafts ...*raft.Raft) {
 		r.Stop()
 	}
 }
+
+func (s *testStorage) SaveHardState(state types.HardState) error { s.hardState = state; return nil }

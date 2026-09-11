@@ -77,3 +77,9 @@ func shardNoToShardID(shardNo string) uint64 {
 	}
 	return h.Sum64()
 }
+
+func NewHardStateKey(shardNo string) []byte {
+	k := NewAppliedIndexKey(shardNo)
+	k[0], k[1] = 0x5, 0x5
+	return k
+}

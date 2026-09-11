@@ -180,7 +180,13 @@ func (p *PebbleShardLogStorage) GetState(shardNo string) (types.RaftState, error
 			zap.Uint64("newAppliedIndex", applied))
 	}
 
+	state, err := p.hardState(shardNo)
+	if err != nil {
+		return types.RaftState{}, err
+	}
+
 	return types.RaftState{
+		HardState:    state,
 		LastLogIndex: lastLogIndex,
 		LastTerm:     lastLogTerm,
 		AppliedIndex: applied,
@@ -756,3 +762,21 @@ func (p *PebbleShardLogStorage) DeleteLeaderTermStartIndexGreaterThanTerm(shardN
 // func (l *localStorage) getChannelSlotId(channelId string) uint32 {
 // 	return wkutil.GetSlotNum(int(l.opts.SlotCount), channelId)
 // }
+
+func (p *PebbleShardLogStorage) SaveHardState(shardNo string, state types.HardState) error {
+	return p.shardDB(shardNo).Set(key.NewHardStateKey(shardNo), state.Marshal(), pebble.Sync)
+}
+
+func (p *PebbleShardLogStorage) hardState(shardNo string) (types.HardState, error) {
+	var state types.HardState
+	data, closer, err := p.shardDB(shardNo).Get(key.NewHardStateKey(shardNo))
+	if errors.Is(err, pebble.ErrNotFound) {
+		return state, nil
+	}
+	if err != nil {
+		return state, err
+	}
+	defer closer.Close()
+	err = state.Unmarshal(data)
+	return state, err
+}

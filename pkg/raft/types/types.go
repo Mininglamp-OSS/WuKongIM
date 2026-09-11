@@ -749,6 +749,7 @@ func (t *TermStartIndexInfo) Clone() *TermStartIndexInfo {
 const LocalNode = math.MaxUint64
 
 type RaftState struct {
+	HardState HardState
 	// LastLogIndex 最后一个日志的下标
 	LastLogIndex uint64
 	// LastTerm 最后一个日志的任期

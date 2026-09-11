@@ -24,7 +24,12 @@ func (s *storage) GetState(channelId string, channelType uint8) (types.RaftState
 		return types.RaftState{}, err
 	}
 
+	state, err := s.db.RaftHardState(wkutil.ChannelToKey(channelId, channelType))
+	if err != nil {
+		return types.RaftState{}, err
+	}
 	return types.RaftState{
+		HardState:    state,
 		LastLogIndex: uint64(lastMsg.MessageSeq),
 		LastTerm:     uint32(lastMsg.Term),
 		AppliedIndex: uint64(lastMsg.MessageSeq),
