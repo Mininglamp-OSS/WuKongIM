@@ -6,6 +6,9 @@ import (
 )
 
 func (n *Node) BecomeCandidate() {
+	if !n.isVoter(n.opts.NodeId) || n.cfg.Role == types.RoleLearner {
+		return
+	}
 	if n.cfg.Role == types.RoleLeader {
 		n.Panic("invalid transition [leader -> candidate]")
 	}

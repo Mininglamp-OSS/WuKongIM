@@ -41,6 +41,12 @@ func (s *Server) applyLog(log types.Log) error {
 		s.Error("save config err", zap.Error(err))
 		return err
 	}
+	// Membership becomes visible to Raft only after its version and saved
+	// application config are updated. Learners must not promote on VoteReq.
+	switch cmd.CmdType {
+	case CMDTypeConfigChange, CMDTypeNodeJoin, CMDTypeNodeJoining, CMDTypeNodeJoined:
+		s.switchConfig(s.config)
+	}
 	// 配置发送变化
 	s.NotifyConfigChangeEvent()
 	return nil
@@ -132,14 +138,12 @@ func (s *Server) handleNodeJoin(cmd *CMD) error {
 		s.config.cfg.MigrateFrom = newNode.Id
 		s.config.cfg.MigrateTo = newNode.Id
 	}
-	s.switchConfig(s.config)
 	return nil
 }
 
 func (s *Server) handleNodeJoining(cmd *CMD) error {
 	nodeId := binary.BigEndian.Uint64(cmd.Data)
 	s.config.updateNodeJoining(nodeId)
-	s.switchConfig(s.config)
 	return nil
 }
 
@@ -150,7 +154,6 @@ func (s *Server) handleNodeJoined(cmd *CMD) error {
 		return err
 	}
 	s.config.updateNodeJoined(nodeId, slots)
-	s.switchConfig(s.config)
 	return nil
 }
 
